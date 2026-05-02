@@ -10,9 +10,9 @@ from datetime import datetime, timedelta
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 
 # Test credentials
-ADMIN_CREDS = {"email": "admin@meritinfi.com", "password": "admin123"}
-TEACHER_CREDS = {"email": "teacher@meritinfi.com", "password": "teacher123"}
-STUDENT_CREDS = {"email": "student@meritinfi.com", "password": "student123"}
+ADMIN_CREDS = {"email": "admin@growcad.in", "password": "admin123"}
+TEACHER_CREDS = {"email": "teacher@growcad.in", "password": "teacher123"}
+STUDENT_CREDS = {"email": "student@growcad.in", "password": "student123"}
 
 
 @pytest.fixture(scope="module")

@@ -9,11 +9,11 @@ import os
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 
 # Test credentials
-ADMIN_EMAIL = "admin@meritinfi.com"
+ADMIN_EMAIL = "admin@growcad.in"
 ADMIN_PASS = "admin123"
-TEACHER_EMAIL = "teacher@meritinfi.com"
+TEACHER_EMAIL = "teacher@growcad.in"
 TEACHER_PASS = "teacher123"
-STUDENT_EMAIL = "student@meritinfi.com"
+STUDENT_EMAIL = "student@growcad.in"
 STUDENT_PASS = "student123"
 
 

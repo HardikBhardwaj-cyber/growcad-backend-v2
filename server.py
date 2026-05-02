@@ -46,7 +46,7 @@ if TWILIO_SID and TWILIO_TOKEN:
 else:
     logger.info("Twilio credentials not configured - SMS/WhatsApp disabled, in-app notifications active")
 
-app = FastAPI(title="Meritinfi API")
+app = FastAPI(title="Growcad API")
 api = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -245,7 +245,7 @@ class GoogleService:
     @staticmethod
     def upload_to_r2(class_id, file_bytes):
         """Mock: Would upload to Cloudflare R2. Returns URL."""
-        return f"https://r2.meritinfi.com/recordings/{class_id}.mp4"
+        return f"https://r2.growcad.in/recordings/{class_id}.mp4"
 
 
 google_service = GoogleService()
@@ -2026,16 +2026,16 @@ async def do_seed():
     })
 
     await db.users.insert_one({
-        "id": "user_admin_001", "name": "Aman Gupta", "email": "admin@meritinfi.com",
+        "id": "user_admin_001", "name": "Aman Gupta", "email": "admin@growcad.in",
         "passwordHash": hash_pw("admin123"), "role": "admin", "instituteId": iid, "createdAt": now_iso()
     })
 
     teachers_data = [
-        {"name": "Rajesh Kumar", "email": "teacher@meritinfi.com", "phone": "+91-9876543211", "subject": "Physics", "salary": 45000},
-        {"name": "Priya Sharma", "email": "priya@meritinfi.com", "phone": "+91-9876543212", "subject": "Chemistry", "salary": 42000},
-        {"name": "Amit Patel", "email": "amit@meritinfi.com", "phone": "+91-9876543213", "subject": "Mathematics", "salary": 48000},
-        {"name": "Sunita Verma", "email": "sunita@meritinfi.com", "phone": "+91-9876543214", "subject": "Biology", "salary": 40000},
-        {"name": "Deepak Singh", "email": "deepak@meritinfi.com", "phone": "+91-9876543215", "subject": "English", "salary": 35000},
+        {"name": "Rajesh Kumar", "email": "teacher@growcad.in", "phone": "+91-9876543211", "subject": "Physics", "salary": 45000},
+        {"name": "Priya Sharma", "email": "priya@growcad.in", "phone": "+91-9876543212", "subject": "Chemistry", "salary": 42000},
+        {"name": "Amit Patel", "email": "amit@growcad.in", "phone": "+91-9876543213", "subject": "Mathematics", "salary": 48000},
+        {"name": "Sunita Verma", "email": "sunita@growcad.in", "phone": "+91-9876543214", "subject": "Biology", "salary": 40000},
+        {"name": "Deepak Singh", "email": "deepak@growcad.in", "phone": "+91-9876543215", "subject": "English", "salary": 35000},
     ]
     teacher_ids = []
     for i, td in enumerate(teachers_data):
@@ -2090,7 +2090,7 @@ async def do_seed():
         sid = f"student_{i + 1:03d}"
         student_ids.append(sid)
         bid = batch_ids[batch_assignment[i]]
-        email = "student@meritinfi.com" if i == 0 else f"{slug}@meritinfi.com"
+        email = "student@growcad.in" if i == 0 else f"{slug}@growcad.in"
         await db.students.insert_one({
             "id": sid, "name": name, "phoneNumber": f"+91-98765{43200 + i}",
             "parentPhoneNumber": f"+91-98765{43300 + i}", "email": email,
@@ -2174,7 +2174,7 @@ async def do_seed():
             })
 
     notifs = [
-        {"title": "Welcome to Meritinfi!", "message": "Your institute has been set up successfully.", "type": "system"},
+        {"title": "Welcome to Growcad!", "message": "Your institute has been set up successfully.", "type": "system"},
         {"title": "New Teacher Added", "message": "Rajesh Kumar has joined as Physics teacher.", "type": "teacher"},
         {"title": "Fee Reminder", "message": "5 students have pending fee payments for this month.", "type": "fee"},
         {"title": "Attendance Report", "message": "Weekly attendance report is ready for review.", "type": "attendance"},
@@ -2232,7 +2232,7 @@ async def do_seed():
         rec_size = 0
         if rec_status == "ready":
             cid = uid()[:8]
-            rec_url = f"https://r2.meritinfi.com/recordings/{cid}.mp4"
+            rec_url = f"https://r2.growcad.in/recordings/{cid}.mp4"
             rec_size = round(dur_min * 15.5, 1)
 
         await db.live_classes.insert_one({
@@ -2252,9 +2252,9 @@ async def do_seed():
     return {
         "message": "Demo data seeded successfully",
         "credentials": {
-            "admin": "admin@meritinfi.com / admin123",
-            "teacher": "teacher@meritinfi.com / teacher123",
-            "student": "student@meritinfi.com / student123"
+            "admin": "admin@growcad.in / admin123",
+            "teacher": "teacher@growcad.in / teacher123",
+            "student": "student@growcad.in / student123"
         }
     }
 
@@ -2277,7 +2277,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    logger.info("Starting Meritinfi API...")
+    logger.info("Starting Growcad API...")
     await do_seed()
     asyncio.create_task(_reminder_background_loop())
     logger.info("Fee reminder background job started")

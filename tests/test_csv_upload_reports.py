@@ -480,7 +480,7 @@ def auth_token():
     """Get admin authentication token"""
     response = requests.post(
         f'{BASE_URL}/api/auth/login',
-        json={"email": "admin@meritinfi.com", "password": "admin123"}
+        json={"email": "admin@growcad.in", "password": "admin123"}
     )
     if response.status_code != 200:
         pytest.skip(f"Admin login failed: {response.text}")
@@ -492,7 +492,7 @@ def teacher_token():
     """Get teacher authentication token"""
     response = requests.post(
         f'{BASE_URL}/api/auth/login',
-        json={"email": "teacher@meritinfi.com", "password": "teacher123"}
+        json={"email": "teacher@growcad.in", "password": "teacher123"}
     )
     if response.status_code != 200:
         pytest.skip(f"Teacher login failed: {response.text}")
@@ -504,7 +504,7 @@ def student_token():
     """Get student authentication token"""
     response = requests.post(
         f'{BASE_URL}/api/auth/login',
-        json={"email": "student@meritinfi.com", "password": "student123"}
+        json={"email": "student@growcad.in", "password": "student123"}
     )
     if response.status_code != 200:
         pytest.skip(f"Student login failed: {response.text}")
