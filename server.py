@@ -47,6 +47,9 @@ RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 OTP_EXPIRY_MINS = int(os.environ.get("OTP_EXPIRY_MINS", 5))
 OTP_RATE_WINDOW_S = int(os.environ.get("OTP_RATE_WINDOW_S", 30))
 TOKEN_VERSION = int(os.environ.get("TOKEN_VERSION", 1))
+SUPERADMIN_EMAIL = os.environ.get("SUPERADMIN_EMAIL", "").strip().lower()
+SUPERADMIN_PASSWORD = os.environ.get("SUPERADMIN_PASSWORD", "")
+SUPERADMIN_NAME = os.environ.get("SUPERADMIN_NAME", "Growcad Super Admin")
 
 rzp_client = (
     razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
@@ -229,6 +232,38 @@ def hash_pw(pw):
 
 def check_pw(pw, h):
     return bcrypt.checkpw(pw.encode(), h.encode())
+
+
+async def ensure_superadmin_account():
+    """Create or refresh the platform super-admin from Railway env vars."""
+    if not SUPERADMIN_EMAIL or not SUPERADMIN_PASSWORD:
+        logger.info("SUPERADMIN_EMAIL/SUPERADMIN_PASSWORD not configured; skipping super-admin bootstrap")
+        return
+
+    existing = await db.users.find_one({"email": SUPERADMIN_EMAIL, "role": "superadmin"})
+    update = {
+        "name": SUPERADMIN_NAME,
+        "email": SUPERADMIN_EMAIL,
+        "role": "superadmin",
+        "instituteId": "",
+        "isVerified": True,
+        "updatedAt": now_iso(),
+    }
+
+    if existing:
+        if os.environ.get("RESET_SUPERADMIN_PASSWORD", "").lower() == "true":
+            update["passwordHash"] = hash_pw(SUPERADMIN_PASSWORD)
+        await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
+        logger.info("Super-admin account refreshed")
+        return
+
+    await db.users.insert_one({
+        "id": uid(),
+        **update,
+        "passwordHash": hash_pw(SUPERADMIN_PASSWORD),
+        "createdAt": now_iso(),
+    })
+    logger.info("Super-admin account created")
 
 
 def make_token(user_id, role, institute_id, slug=None):
@@ -1248,6 +1283,175 @@ async def list_pending_approvals(user=Depends(auth)):
         )
 
     return insts
+
+
+def _usage_limits(plan: str, addons: list = None) -> dict:
+    addons = set(addons or [])
+    plan_limits = {
+        "starter": {"emails": 1000, "whatsapp": 0, "storageGb": 2},
+        "growth": {"emails": 2500, "whatsapp": 0, "storageGb": 5},
+        "scale": {"emails": 5000, "whatsapp": 0, "storageGb": 10},
+        "pro": {"emails": 10000, "whatsapp": 0, "storageGb": 20},
+        "enterprise": {"emails": 20000, "whatsapp": 0, "storageGb": 50},
+        "standard": {"emails": 5000, "whatsapp": 0, "storageGb": 10},
+        "base": {"emails": 1000, "whatsapp": 0, "storageGb": 1},
+    }
+    limits = plan_limits.get((plan or "starter").lower(), plan_limits["starter"]).copy()
+
+    if "email_utility" in addons:
+        limits["emails"] += 10000
+    if "whatsapp_marketing" in addons:
+        limits["whatsapp"] += 5000
+    if "whatsapp_utility" in addons:
+        limits["whatsapp"] += 3000
+    if "live_recording" in addons:
+        limits["storageGb"] += 100
+    elif "live_classes" in addons:
+        limits["storageGb"] += 10
+
+    return limits
+
+
+@api.get("/admin/dashboard")
+async def superadmin_dashboard(user=Depends(auth)):
+    if user.get("role") != "superadmin":
+        raise HTTPException(403, "Super-admin only.")
+
+    institutes = await db.institutes.find({}, {"_id": 0}).sort("createdAt", -1).to_list(500)
+    institute_ids = [inst.get("id") for inst in institutes if inst.get("id")]
+
+    if not institute_ids:
+        return {
+            "summary": {
+                "totalInstitutes": 0,
+                "activeInstitutes": 0,
+                "pendingApprovals": 0,
+                "rejectedInstitutes": 0,
+                "totalStudents": 0,
+                "totalTeachers": 0,
+                "totalRevenue": 0,
+                "usage": {"emails": 0, "whatsapp": 0, "sms": 0, "storageGb": 0},
+            },
+            "institutes": [],
+            "pendingApprovals": [],
+        }
+
+    (
+        subscriptions,
+        student_agg,
+        teacher_agg,
+        storage_agg,
+        message_agg,
+        reminder_agg,
+    ) = await asyncio.gather(
+        db.subscriptions.find(
+            {"instituteId": {"$in": institute_ids}},
+            {"_id": 0},
+        ).sort("createdAt", -1).to_list(1000),
+        db.students.aggregate([
+            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$group": {"_id": "$instituteId", "count": {"$sum": 1}}},
+        ]).to_list(500),
+        db.teachers.aggregate([
+            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$group": {"_id": "$instituteId", "count": {"$sum": 1}}},
+        ]).to_list(500),
+        db.live_classes.aggregate([
+            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$group": {"_id": "$instituteId", "recordingMb": {"$sum": {"$ifNull": ["$recordingSize", 0]}}}},
+        ]).to_list(500),
+        db.message_logs.aggregate([
+            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$group": {"_id": {"instituteId": "$instituteId", "channel": "$channel"}, "count": {"$sum": 1}}},
+        ]).to_list(1000),
+        db.reminder_logs.aggregate([
+            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$group": {"_id": {"instituteId": "$instituteId", "channel": "$channel"}, "count": {"$sum": 1}}},
+        ]).to_list(1000),
+    )
+
+    latest_sub = {}
+    for sub in subscriptions:
+        iid = sub.get("instituteId")
+        if iid and iid not in latest_sub:
+            latest_sub[iid] = sub
+
+    student_counts = {row["_id"]: row["count"] for row in student_agg}
+    teacher_counts = {row["_id"]: row["count"] for row in teacher_agg}
+    storage_mb = {row["_id"]: row.get("recordingMb", 0) for row in storage_agg}
+
+    usage_by_iid = {
+        iid: {"emails": 0, "whatsapp": 0, "sms": 0, "inApp": 0}
+        for iid in institute_ids
+    }
+    for row in [*message_agg, *reminder_agg]:
+        key = row.get("_id", {})
+        iid = key.get("instituteId")
+        channel = (key.get("channel") or "").lower()
+        if iid not in usage_by_iid:
+            continue
+        if channel == "email":
+            usage_by_iid[iid]["emails"] += row["count"]
+        elif channel == "whatsapp":
+            usage_by_iid[iid]["whatsapp"] += row["count"]
+        elif channel == "sms":
+            usage_by_iid[iid]["sms"] += row["count"]
+        else:
+            usage_by_iid[iid]["inApp"] += row["count"]
+
+    rows = []
+    for inst in institutes:
+        iid = inst.get("id", "")
+        sub = latest_sub.get(iid, {})
+        plan = inst.get("plan") or sub.get("planType") or "starter"
+        addons = inst.get("addons") or sub.get("addons") or []
+        usage = usage_by_iid.get(iid, {"emails": 0, "whatsapp": 0, "sms": 0, "inApp": 0})
+        usage["storageGb"] = round(storage_mb.get(iid, 0) / 1024, 2)
+
+        rows.append({
+            "id": iid,
+            "name": inst.get("name", ""),
+            "slug": inst.get("slug", ""),
+            "domain": inst.get("domain") or (f"{inst.get('slug')}.growcad.in" if inst.get("slug") else ""),
+            "ownerId": inst.get("ownerId", ""),
+            "status": inst.get("subscriptionStatus", "pending"),
+            "plan": plan,
+            "addons": addons,
+            "billingCycle": inst.get("billingCycle") or sub.get("billingCycle", ""),
+            "amount": sub.get("amount", 0),
+            "paymentMode": sub.get("paymentMode", ""),
+            "subscriptionId": sub.get("id", ""),
+            "createdAt": inst.get("createdAt", ""),
+            "students": student_counts.get(iid, 0),
+            "teachers": teacher_counts.get(iid, 0),
+            "usage": usage,
+            "limits": _usage_limits(plan, addons),
+            "subscription": sub,
+        })
+
+    summary_usage = {
+        "emails": sum(row["usage"]["emails"] for row in rows),
+        "whatsapp": sum(row["usage"]["whatsapp"] for row in rows),
+        "sms": sum(row["usage"]["sms"] for row in rows),
+        "storageGb": round(sum(row["usage"]["storageGb"] for row in rows), 2),
+    }
+
+    summary = {
+        "totalInstitutes": len(rows),
+        "activeInstitutes": sum(1 for row in rows if row["status"] == "active"),
+        "pendingApprovals": sum(1 for row in rows if row["status"] == "pending_approval"),
+        "rejectedInstitutes": sum(1 for row in rows if row["status"] == "rejected"),
+        "totalStudents": sum(row["students"] for row in rows),
+        "totalTeachers": sum(row["teachers"] for row in rows),
+        "totalRevenue": sum(row.get("amount", 0) or 0 for row in rows if row["status"] in ("active", "pending_approval")),
+        "usage": summary_usage,
+    }
+
+    return {
+        "summary": summary,
+        "institutes": rows,
+        "pendingApprovals": [row for row in rows if row["status"] == "pending_approval"],
+    }
 
 
 
@@ -3715,6 +3919,8 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     logger.info("Starting Growcad API...")
+    await ensure_superadmin_account()
+
     if os.environ.get("ENV") != "production":
         await do_seed()
 
