@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -16,6 +16,18 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
+import hashlib
+import re
+import httpx
+import razorpay
+import hmac
+import secrets
+from pymongo.errors import DuplicateKeyError
+from pymongo import UpdateOne
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -25,9 +37,28 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 JWT_SECRET = os.environ.get('JWT_SECRET')
+if not JWT_SECRET:
+    raise Exception("JWT_SECRET is missing in environment")
 JWT_ALGO = "HS256"
 
-logging.basicConfig(level=logging.INFO)
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+OTP_EXPIRY_MINS = int(os.environ.get("OTP_EXPIRY_MINS", 5))
+OTP_RATE_WINDOW_S = int(os.environ.get("OTP_RATE_WINDOW_S", 30))
+TOKEN_VERSION = int(os.environ.get("TOKEN_VERSION", 1))
+
+rzp_client = (
+    razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET
+    else None
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ─── Twilio (optional - activates when env vars are present) ───
@@ -46,7 +77,136 @@ if TWILIO_SID and TWILIO_TOKEN:
 else:
     logger.info("Twilio credentials not configured - SMS/WhatsApp disabled, in-app notifications active")
 
+
+
 app = FastAPI(title="Growcad API")
+@app.on_event("startup")
+async def create_indexes():
+    # ─── users ───
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("mobile")
+
+    # ─── students ───
+    await db.students.create_index([("instituteId", 1), ("batchId", 1)])
+    await db.students.create_index([("instituteId", 1), ("name", 1)])
+    await db.students.create_index("email")
+
+    # ─── teachers ───
+    await db.teachers.create_index("instituteId")
+
+    # ─── batches ───
+    await db.batches.create_index("instituteId")
+    await db.batches.create_index([("instituteId", 1), ("teacherId", 1)])
+
+    # ─── attendance ───
+    await db.attendance.create_index([("studentId", 1), ("date", 1)])
+    await db.attendance.create_index([("instituteId", 1), ("date", 1)])
+    await db.attendance.create_index([("batchId", 1), ("instituteId", 1)])
+    await db.attendance.create_index([("instituteId", 1), ("batchId", 1), ("date", 1)])
+
+    # ─── student_fees ───
+    await db.student_fees.create_index([("instituteId", 1), ("batchId", 1)])
+    await db.student_fees.create_index([("instituteId", 1), ("studentId", 1)])
+    await db.student_fees.create_index("studentId")
+
+    # ─── tests / marks ───
+    await db.tests.create_index([("instituteId", 1), ("batchId", 1)])
+    await db.marks.create_index([("testId", 1), ("studentId", 1)])
+    await db.marks.create_index([("instituteId", 1), ("studentId", 1)])
+
+    # ─── notifications ───
+    await db.notifications.create_index([("instituteId", 1), ("createdAt", -1)])
+
+    # ─── announcements ───
+    await db.announcements.create_index([("instituteId", 1), ("createdAt", -1)])
+
+    # ─── live_classes ───
+    await db.live_classes.create_index([("instituteId", 1), ("startTime", -1)])
+    await db.live_classes.create_index([("batchId", 1), ("instituteId", 1)])
+
+    # ─── otp_verifications ───
+    await db.otp_verifications.create_index(
+        [("target", 1), ("channel", 1)], unique=True
+    )
+
+    # ─── reminder / message logs ───
+    await db.reminder_logs.create_index([("instituteId", 1), ("timestamp", -1)])
+    await db.message_logs.create_index([("instituteId", 1), ("timestamp", -1)])
+    await db.absent_alerts.create_index([("studentId", 1), ("date", 1), ("instituteId", 1)])
+
+    await db.institutes.create_index("slug", unique=True)
+    await db.subscriptions.create_index("razorpayPaymentId", unique=True, sparse=True)
+    await db.subscriptions.create_index("razorpayOrderId", sparse=True)
+    await db.webhook_events.create_index("razorpayEventId", unique=True)
+    await db.webhook_events.create_index("processedAt", expireAfterSeconds=30 * 86400)
+    await db.otp_rate_limits.create_index("target", unique=True)
+    await db.otp_rate_limits.create_index("expiresAt", expireAfterSeconds=0)
+
+
+    logger.info("All MongoDB indexes created")
+
+@app.on_event("startup")
+async def otp_cleanup_job():
+    async def cleanup():
+        while True:
+            await db.otp_verifications.delete_many({
+                "expires_at": {"$lt": datetime.now(timezone.utc).isoformat()}
+            })
+            await asyncio.sleep(300)
+
+    asyncio.create_task(cleanup())
+# ─────────────────────────────────────────────────────────────────────────────
+# MIDDLEWARE: extract X-Institute-Slug and attach instituteId to requests
+# ─────────────────────────────────────────────────────────────────────────────
+
+#Add this BEFORE app.include_router(api) in server.py:
+
+
+
+class TenantMiddleware(BaseHTTPMiddleware):
+    # Routes where an unknown/missing slug must not block the request.
+    # Onboarding, auth, institute creation and seed are public by nature.
+    _SLUG_EXEMPT_PREFIXES = (
+        "/api/auth/",
+        "/api/institute/",
+        "/api/payments/webhook",
+        "/api/seed",
+        "/docs",
+        "/openapi",
+        "/redoc",
+        "/health",
+    )
+
+    async def dispatch(self, request: Request, call_next):
+        slug = request.headers.get("X-Institute-Slug", "").lower().strip()
+
+        if slug:
+            path = request.url.path
+            is_exempt = any(path.startswith(p) for p in self._SLUG_EXEMPT_PREFIXES)
+
+            if is_exempt:
+                # Don't require the institute to exist during onboarding/auth flows.
+                request.state.institute_id = None
+                request.state.institute    = None
+            else:
+                inst = await db.institutes.find_one({"slug": slug}, {"_id": 0})
+                if not inst:
+                    return JSONResponse(
+                        status_code=404,
+                        content={"detail": "Invalid institute slug"}
+                    )
+                request.state.institute_id = inst["id"]
+                request.state.institute    = inst
+        else:
+            request.state.institute_id = None
+            request.state.institute    = None
+
+        return await call_next(request)
+
+app.add_middleware(TenantMiddleware)
+
+
+
 api = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -60,27 +220,50 @@ def now_iso():
 
 
 def hash_pw(pw):
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=12)).decode()
 
 
 def check_pw(pw, h):
     return bcrypt.checkpw(pw.encode(), h.encode())
 
 
-def make_token(user_id, role, institute_id):
+def make_token(user_id, role, institute_id, slug=None):
     return jwt.encode(
-        {"uid": user_id, "role": role, "iid": institute_id,
-         "exp": datetime.now(timezone.utc) + timedelta(hours=48)},
-        JWT_SECRET, algorithm=JWT_ALGO
+        {
+            "uid": user_id,
+            "role": role,
+            "iid": institute_id,
+            "slug": slug,
+            "ver": TOKEN_VERSION,
+            "exp": datetime.now(timezone.utc) + timedelta(hours=48)
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGO
     )
 
 
 async def auth(cred: HTTPAuthorizationCredentials = Depends(security)):
     try:
         p = jwt.decode(cred.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
-        u = await db.users.find_one({"id": p["uid"]}, {"_id": 0})
+        uid_claim = p.get("uid")
+        iid_claim = p.get("iid")   # may be "" for pre-onboarding admin tokens
+
+        if p.get("ver", 0) < TOKEN_VERSION:
+            raise HTTPException(401, "Token revoked. Please log in again.")
+
+        if not uid_claim:
+            raise HTTPException(401, "Malformed token")
+
+        # Build the query: iid can be "" (pre-onboarding) or a real UUID.
+        # Allow both so admins can call /institute/select-plan with the token
+        # returned by /institute/create.
+        query: dict = {"id": uid_claim}
+        if iid_claim is not None:
+            query["instituteId"] = iid_claim
+
+        u = await db.users.find_one(query, {"_id": 0})
         if not u:
-            raise HTTPException(401, "Not found")
+            raise HTTPException(401, "User not found")
         return u
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
@@ -109,6 +292,941 @@ async def get_teacher_batch_ids(user):
     # Fallback: find batches where this teacher is assigned
     batches = await db.batches.find({"teacherId": user.get("teacherId", ""), "instituteId": user["instituteId"]}, {"_id": 0}).to_list(100)
     return [b["id"] for b in batches]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BULK FETCH HELPERS  — use these instead of per-row find_one calls
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_students_map(institute_id: str, student_ids: list = None) -> dict:
+    """Return {student_id: student_doc}. Optionally scoped to a list of IDs."""
+    q = {"instituteId": institute_id}
+    if student_ids is not None:
+        q["id"] = {"$in": list(set(student_ids))}
+    docs = await db.students.find(q, {"_id": 0}).to_list(2000)
+    return {d["id"]: d for d in docs}
+
+
+async def _get_batches_map(institute_id: str, batch_ids: list = None) -> dict:
+    """Return {batch_id: batch_doc}."""
+    q = {"instituteId": institute_id}
+    if batch_ids is not None:
+        q["id"] = {"$in": list(set(batch_ids))}
+    docs = await db.batches.find(q, {"_id": 0}).to_list(500)
+    return {d["id"]: d for d in docs}
+
+
+async def _get_teachers_map(institute_id: str, teacher_ids: list = None) -> dict:
+    """Return {teacher_id: teacher_doc}."""
+    q = {"instituteId": institute_id}
+    if teacher_ids is not None:
+        q["id"] = {"$in": list(set(teacher_ids))}
+    docs = await db.teachers.find(q, {"_id": 0}).to_list(500)
+    return {d["id"]: d for d in docs}
+
+"""
+backend/auth_routes.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW ROUTES — paste these into server.py alongside the
+existing auth block. They slot into the same `api` router
+and share all existing helpers (uid, now_iso, hash_pw,
+check_pw, make_token, db, jwt, etc.).
+
+ENVIRONMENT VARIABLES REQUIRED:
+  MSG91_AUTH_KEY   – MSG91 key for mobile OTP
+  RESEND_API_KEY   – Resend key for email OTP
+  OTP_EXPIRY_MINS  – default 5 (optional override)
+
+NEW COLLECTIONS:
+  otp_verifications  { id, target, channel, otp_hash, verified, expires_at, created_at }
+  subscriptions      { id, institute_id, plan_type, addons, billing_cycle, amount, status, created_at }
+
+The existing `institutes` collection is extended with:
+  slug, address, total_strength, subscription_status, owner_id
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+# ── Extra imports (add to server.py top) ─────────────────────────────────────
+# import hashlib
+# import httpx          # pip install httpx
+# from pydantic import BaseModel, Field
+# from typing import Optional, List
+
+# ── Extra env vars ────────────────────────────────────────────────────────────
+# MSG91_AUTH_KEY  = os.environ.get("MSG91_AUTH_KEY", "")
+# RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+# OTP_EXPIRY_MINS = int(os.environ.get("OTP_EXPIRY_MINS", 5))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYDANTIC MODELS  (add to the existing Models section)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdminSignupReq(BaseModel):
+    name:     str
+    mobile:   str          # digits only, 10 chars
+    email:    str
+    password: str
+
+class SendOtpReq(BaseModel):
+    target:  str           # mobile number or email address
+    channel: str = "mobile"  # "mobile" | "email"
+
+class VerifyOtpReq(BaseModel):
+    target:  str
+    otp:     str
+    channel: str = "mobile"
+
+class AdminLoginReq(BaseModel):
+    email:    str
+    password: str
+
+class SubdomainLoginReq(BaseModel):
+    mobile: str
+    otp:    str
+    slug:   Optional[str] = None            # institute slug from frontend subdomain detection
+
+class InstituteCreateReq(BaseModel):
+    mobile:           str
+    email:            str
+    institute_name:   str
+    institute_slug:   str
+    institute_address: str = ""
+    total_strength:   str = "0-150"
+
+class SelectPlanReq(BaseModel):
+    institute_id: str
+    plan_type: str
+    addons: List[str] = []
+    billing_cycle: str = "monthly"
+    amount: float
+    payment_mode: str = "razorpay"  # "razorpay" | "cash"
+    razorpay_payment_id: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
+
+
+class CreateOrderReq(BaseModel):
+    institute_id: str
+    plan_type: str
+    addons: List[str] = []
+    billing_cycle: str = "monthly"
+    amount: float
+    currency: str = "INR"
+
+
+
+class ApprovalReq(BaseModel):
+    institute_id: str
+    action: str
+    note: str = ""
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OTP HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+otp_rate_limit = {}
+
+async def check_otp_rate(target):
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=OTP_RATE_WINDOW_S)
+
+    try:
+        await db.otp_rate_limits.insert_one({
+            "target": target,
+            "createdAt": now_iso(),
+            "expiresAt": expires_at,
+        })
+    except DuplicateKeyError:
+        raise HTTPException(
+            429,
+            f"Wait {OTP_RATE_WINDOW_S} seconds before requesting another OTP",
+        )
+
+
+def _otp_hash(otp: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), otp.encode(), hashlib.sha256).hexdigest()
+
+
+def _otp_matches(otp: str, stored_hash: str) -> bool:
+    return hmac.compare_digest(stored_hash or "", _otp_hash(otp))
+
+
+def _generate_otp(length: int = 6) -> str:
+    return "".join(str(secrets.randbelow(10)) for _ in range(length))
+
+
+
+async def _send_mobile_otp(mobile: str, otp: str) -> bool:
+    """Send OTP via MSG91 Flow API. Returns True on success."""
+    key         = os.getenv("MSG91_AUTH_KEY", "")
+    template_id = os.getenv("MSG91_TEMPLATE_ID", "")
+
+    if not key or not template_id:
+        logger.warning(f"[OTP-DEV] MSG91 not configured — mobile={mobile} otp={otp}")
+        return True
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                "https://control.msg91.com/api/v5/flow/",
+                json={
+                    "flow_id": template_id,
+                    "mobiles": f"91{mobile}",
+                    "VAR1":    otp,
+                },
+                headers={
+                    "authkey":      key,
+                    "Content-Type": "application/json",
+                },
+            )
+        if r.status_code == 200:
+            return True
+        logger.error(f"MSG91 non-200: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        logger.error(f"MSG91 error: {e}")
+        return False
+
+
+async def _send_email_otp(email: str, otp: str) -> bool:
+    """Send OTP via Resend. Returns True on success."""
+    key        = os.getenv("RESEND_API_KEY", "")
+    email_from = os.getenv("EMAIL_FROM", "Growcad <noreply@growcad.in>")
+
+    if not key:
+        logger.warning(f"[OTP-DEV] Resend not configured — email={email} otp={otp}")
+        return True
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                "https://api.resend.com/emails",
+                json={
+                    "from":    email_from,
+                    "to":      [email],
+                    "subject": "Your Growcad OTP",
+                    "html":    (
+                        f'<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px">'
+                        f'<h2 style="color:#1a1625">Verify your email</h2>'
+                        f'<p>Use the code below to complete your Growcad sign-up.</p>'
+                        f'<div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#6C3CF4;'
+                        f'background:#f3f0ff;border-radius:12px;padding:20px 24px;'
+                        f'display:inline-block;margin:16px 0">{otp}</div>'
+                        f'<p style="color:#888">Valid for 5 minutes.</p>'
+                        f'</div>'
+                    ),
+                },
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type":  "application/json",
+                },
+            )
+        if r.status_code in (200, 201):
+            return True
+        logger.error(f"Resend non-200: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Resend error: {e}")
+        return False
+
+
+# ── Public wrappers (raise HTTPException on failure) ─────────────────────────
+
+async def send_sms_otp(mobile: str, otp: str) -> None:
+    """Send SMS OTP via MSG91 Flow API. Raises HTTP 500 on failure."""
+    ok = await _send_mobile_otp(mobile, otp)
+    if not ok:
+        raise HTTPException(500, "Failed to send SMS OTP")
+
+
+async def send_email_otp(email: str, otp: str) -> None:
+    """Send email OTP via Resend. Raises HTTP 500 on failure."""
+    ok = await _send_email_otp(email, otp)
+    if not ok:
+        raise HTTPException(500, "Failed to send Email OTP")
+
+
+async def _store_otp(target: str, channel: str, otp: str) -> None:
+    """Upsert OTP record (one live OTP per target+channel at a time)."""
+    expiry_mins = int(os.getenv("OTP_EXPIRY_MINS", 5))
+    await db.otp_verifications.update_one(
+        {"target": target, "channel": channel},
+        {"$set": {
+            "id":         uid(),
+            "otp_hash":   _otp_hash(otp),
+            "verified":   False,
+            "attempts":   0,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=expiry_mins)).isoformat(),
+            "created_at": now_iso(),
+        }},
+        upsert=True,
+    )
+
+
+async def _consume_otp(target: str, channel: str, otp: str) -> bool:
+    rec = await db.otp_verifications.find_one({"target": target, "channel": channel})
+
+    if not rec:
+        return False
+    if rec.get("verified"):
+        return False
+
+    # Parse expires_at safely regardless of whether it carries timezone info
+    expires_raw = rec.get("expires_at", "")
+    try:
+        expires_dt = datetime.fromisoformat(expires_raw)
+    except (ValueError, TypeError):
+        return False
+    # Ensure timezone-aware comparison
+    if expires_dt.tzinfo is None:
+        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+    if expires_dt < datetime.now(timezone.utc):
+        return False
+
+    # 🚨 LIMIT ATTEMPTS
+    if rec.get("attempts", 0) >= 5:
+        raise HTTPException(429, "Too many OTP attempts")
+
+    # ❌ WRONG OTP
+    if not _otp_matches(otp, rec.get("otp_hash", "")):
+        await db.otp_verifications.update_one(
+            {"_id": rec["_id"]},
+            {"$inc": {"attempts": 1}}
+        )
+        return False
+
+    # ✅ CORRECT OTP
+    await db.otp_verifications.update_one(
+        {"_id": rec["_id"]},
+        {"$set": {"verified": True, "otp_hash": None}}
+    )
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW AUTH ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api.post("/auth/send-otp")
+async def send_otp(data: SendOtpReq):
+    """Send a 6-digit OTP to mobile (MSG91 Flow) or email (Resend)."""
+    target  = data.target.strip()
+    channel = data.channel.strip().lower()
+
+    if not target:
+        raise HTTPException(400, "target (mobile number or email) is required.")
+    if channel not in ("mobile", "email"):
+        raise HTTPException(400, "channel must be 'mobile' or 'email'.")
+
+    # Normalise mobile number (strip country code and spaces)
+    if channel == "mobile":
+        target = target.replace("+91", "").replace(" ", "").strip()
+        if not target.isdigit() or len(target) != 10:
+            raise HTTPException(400, "mobile must be a 10-digit number.")
+
+    await check_otp_rate(target)
+    otp = _generate_otp()
+    await _store_otp(target, channel, otp)
+
+    if channel == "mobile":
+        await send_sms_otp(target, otp)
+    else:
+        await send_email_otp(target, otp)
+
+    return {"sent": True, "channel": channel}
+
+
+@api.post("/auth/verify-otp")
+async def verify_otp_endpoint(data: VerifyOtpReq):
+    """Verify an OTP without logging the user in (used during signup flow)."""
+    target  = data.target.strip()
+    channel = data.channel.strip().lower()
+    otp     = data.otp.strip()
+
+    if not target:
+        raise HTTPException(400, "target is required.")
+    if channel == "mobile":
+        target = target.replace("+91", "").replace(" ", "").strip()
+    if not otp.isdigit() or len(otp) != 6:
+        raise HTTPException(400, "OTP must be exactly 6 digits.")
+
+    ok = await _consume_otp(target, channel, otp)
+    if not ok:
+        raise HTTPException(400, "Invalid or expired OTP.")
+    return {"verified": True}
+
+
+@api.post("/auth/admin-signup")
+async def admin_signup(data: AdminSignupReq):
+    """
+    Pre-register admin user + trigger OTPs for both mobile and email.
+    User is created with isVerified=False; /auth/verify-otp must be called
+    for both channels before /institute/create is called.
+
+    Re-signup is allowed if the existing account is still unverified
+    (i.e. the user never finished onboarding), so they can request fresh OTPs.
+    """
+    mobile = data.mobile.replace("+91", "").replace(" ", "").strip()
+    
+
+    email  = data.email.strip().lower()
+
+    existing_email  = await db.users.find_one({"email": email},  {"_id": 0})
+    existing_mobile = await db.users.find_one({"mobile": mobile}, {"_id": 0})
+
+    # Block signup only when the account is already fully set up
+    if existing_email and existing_email.get("isVerified"):
+        raise HTTPException(400, "An account with this email already exists.")
+    if existing_mobile and existing_mobile.get("isVerified") and existing_mobile.get("email") != email:
+        raise HTTPException(400, "An account with this mobile number already exists.")
+
+    if existing_email and not existing_email.get("isVerified"):
+        # Allow re-signup: update the pending record with latest details
+        await db.users.update_one(
+            {"email": email},
+            {"$set": {
+                "name":         data.name.strip(),
+                "mobile":       mobile,
+                "passwordHash": hash_pw(data.password),
+                "isVerified":   False,
+            }},
+        )
+    else:
+        # Fresh signup
+        pending = {
+            "id":           uid(),
+            "name":         data.name.strip(),
+            "mobile":       mobile,
+            "email":        email,
+            "passwordHash": hash_pw(data.password),
+            "role":         "admin",
+            "instituteId":  "",
+            "isVerified":   False,
+            "createdAt":    now_iso(),
+        }
+        await db.users.insert_one(pending)
+
+    # Fire both OTPs concurrently; log failures but don't crash signup
+    mobile_otp = _generate_otp()
+    email_otp  = _generate_otp()
+    await _store_otp(mobile, "mobile", mobile_otp)
+    await _store_otp(email,  "email",  email_otp)
+
+    results = await asyncio.gather(
+        _send_mobile_otp(mobile, mobile_otp),
+        _send_email_otp(email,   email_otp),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(results):
+        if isinstance(r, Exception) or r is False:
+            channel = "mobile" if i == 0 else "email"
+            logger.error(f"OTP send failed for {channel} during admin-signup: {r}")
+
+    return {"sent": True, "mobile": mobile, "email": email}
+
+
+
+
+
+@api.post("/auth/subdomain-login")
+async def subdomain_login(data: SubdomainLoginReq, request: Request):
+    slug = _resolve_slug(request, data.slug)
+
+    if not slug:
+        raise HTTPException(400, "Institute not identified")
+
+    institute = await db.institutes.find_one({"slug": slug}, {"_id": 0})
+    if not institute:
+        raise HTTPException(404, f"Institute '{slug}' not found.")
+
+    iid = institute["id"]
+    mobile = data.mobile.replace("+91", "").replace(" ", "").strip()
+    phone_variants = [
+        mobile,
+        f"+91{mobile}",
+        f"+91-{mobile}",
+        f"91{mobile}",
+    ]
+
+    # ✅ verify OTP
+    ok = await _consume_otp(mobile, "mobile", data.otp)
+    if not ok:
+        raise HTTPException(400, "Invalid or expired OTP.")
+
+    
+
+    # Resolve user: check student first, then teacher, both scoped to this institute
+    student = await db.students.find_one(
+        {"phoneNumber": {"$in": phone_variants}, "instituteId": iid},
+        {"_id": 0},
+    )
+
+
+    u = None
+    if student:
+        u = await db.users.find_one(
+            {"studentId": student["id"], "instituteId": iid}, {"_id": 0}
+        )
+    else:
+        teacher = await db.teachers.find_one(
+            {"phoneNumber": {"$in": phone_variants}, "instituteId": iid},
+            {"_id": 0},
+        )
+
+        if teacher:
+            u = await db.users.find_one(
+                {"teacherId": teacher["id"], "instituteId": iid}, {"_id": 0}
+            )
+
+    if not u:
+        raise HTTPException(
+            404,
+            "No account found for this mobile number in this institute. "
+            "Please contact your admin.",
+        )
+
+    token = make_token(u["id"], u["role"], iid, slug)
+
+    return {
+        "token": token,
+        "user": _safe_user(u),
+        "institute": institute
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTITUTE ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api.get("/institute/check-slug")
+async def check_institute_slug(slug: str):
+    """Returns { available: bool } for a given slug."""
+    slug = slug.lower().strip()
+    if len(slug) < 3:
+        return {"available": False, "reason": "Slug must be at least 3 characters."}
+
+    # Reserved slugs
+    RESERVED = {"www", "api", "app", "mail", "admin", "growcad", "support", "help", "demo"}
+    if slug in RESERVED:
+        return {"available": False, "reason": "This slug is reserved."}
+
+    existing = await db.institutes.find_one({"slug": slug})
+    return {"available": existing is None}
+
+
+@api.post("/institute/create")
+async def create_institute(data: InstituteCreateReq):
+    """
+    Create institute after OTP verification and onboarding form.
+    Links the pending admin user to this institute.
+    """
+    mobile = data.mobile.replace("+91", "").replace(" ", "").strip()
+    email  = data.email.strip().lower()
+    slug   = data.institute_slug.lower().strip()
+
+    # 🔐 Ensure OTP verified before creating institute
+    mobile_verified = await db.otp_verifications.find_one({
+        "target": mobile,
+        "channel": "mobile",
+        "verified": True
+    })
+
+    email_verified = await db.otp_verifications.find_one({
+        "target": email,
+        "channel": "email",
+        "verified": True
+    })
+
+    if not mobile_verified or not email_verified:
+        raise HTTPException(403, "Please verify OTP first")
+
+    # Double-check slug
+    if await db.institutes.find_one({"slug": slug}):
+        raise HTTPException(400, "This slug is already taken.")
+
+    # Find the pending admin user
+    admin = await db.users.find_one({"email": email, "role": "admin"}, {"_id": 0})
+    if not admin:
+        raise HTTPException(404, "Admin account not found. Please sign up first.")
+
+    # Create institute
+    iid = uid()
+    institute = {
+        "id":                 iid,
+        "name":               data.institute_name.strip(),
+        "slug":               slug,
+        "domain":             f"{slug}.growcad.in",
+        "address":            data.institute_address.strip(),
+        "totalStrength":      data.total_strength,
+        "ownerId":            admin["id"],
+        "subscriptionStatus": "pending",   # becomes "active" after plan selection
+        "plan":               None,
+        "addons":             [],
+        "createdAt":          now_iso(),
+    }
+    await db.institutes.insert_one(institute)
+
+    # Link admin → institute + mark verified
+    await db.users.update_one(
+        {"id": admin["id"]},
+        {"$set": {"instituteId": iid, "isVerified": True}},
+    )
+    # Refresh admin dict from DB so all fields (instituteId, isVerified) are current
+    admin = await db.users.find_one({"id": admin["id"]}, {"_id": 0})
+
+    token    = make_token(admin["id"], "admin", iid, slug)
+    user_out = _safe_user(admin)
+    inst_out = {k: v for k, v in institute.items() if k != "_id"}
+
+    return {
+        "token":     token,
+        "user":      user_out,
+        "institute": inst_out,
+    }
+
+
+   # already defined above (alias)
+@api.get("/institute/by-slug")
+async def get_institute_by_slug(slug: str):
+    """Resolve institute by slug (used by subdomain middleware and frontend)."""
+    inst = await db.institutes.find_one({"slug": slug.lower()}, {"_id": 0})
+    if not inst:
+        raise HTTPException(404, f"Institute '{slug}' not found.")
+    return inst
+
+
+@api.get("/institute/by-id/{iid}")
+async def get_institute_by_id(iid: str, user=Depends(auth)):
+    """Fetch institute details by ID (auth required, tenant-scoped)."""
+    if user.get("instituteId") != iid and user.get("role") != "superadmin":
+        raise HTTPException(403, "Access denied.")
+    inst = await db.institutes.find_one({"id": iid}, {"_id": 0})
+    if not inst:
+        raise HTTPException(404, "Institute not found.")
+    return inst
+
+
+@api.post("/payments/create-order")
+async def create_razorpay_order(data: CreateOrderReq, user=Depends(auth)):
+    if user.get("instituteId") != data.institute_id:
+        raise HTTPException(403, "Access denied.")
+
+    if not rzp_client:
+        raise HTTPException(503, "Payment gateway not configured.")
+
+    try:
+        order = rzp_client.order.create({
+            "amount": int(data.amount * 100),
+            "currency": data.currency,
+            "receipt": f"order_{uid()[:8]}",
+            "notes": {
+                "institute_id": data.institute_id,
+                "admin_email": user.get("email", ""),
+            },
+        })
+    except Exception as e:
+        logger.error(f"Razorpay order creation failed: {e}")
+        raise HTTPException(500, "Failed to create payment order.")
+    await db.subscriptions.update_one(
+        {
+            "instituteId": data.institute_id,
+            "status": "pending",
+            "paymentMode": "razorpay",
+        },
+        {
+            "$set": {
+                "planType": data.plan_type,
+                "addons": data.addons,
+                "billingCycle": data.billing_cycle,
+                "amount": data.amount,
+                "paymentMode": "razorpay",
+                "razorpayOrderId": order["id"],
+                "updatedAt": now_iso(),
+            },
+            "$setOnInsert": {
+                "id": uid(),
+                "instituteId": data.institute_id,
+                "status": "pending",
+                "createdAt": now_iso(),
+            },
+        },
+        upsert=True,
+    )
+
+
+
+    return {
+        "id": order["id"],
+        "amount": order["amount"],
+        "currency": order["currency"],
+    }
+@api.post("/payments/webhook")
+async def razorpay_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    if RAZORPAY_WEBHOOK_SECRET:
+        expected = hmac.new(
+            RAZORPAY_WEBHOOK_SECRET.encode(),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected, signature):
+            raise HTTPException(400, "Invalid webhook signature.")
+
+    import json
+    try:
+        payload = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid webhook payload.")
+
+    event_id = payload.get("id", "")
+    event_type = payload.get("event", "")
+
+    try:
+        await db.webhook_events.insert_one({
+            "razorpayEventId": event_id,
+            "event": event_type,
+            "processedAt": datetime.now(timezone.utc),
+        })
+    except DuplicateKeyError:
+        return {"ok": True, "duplicate": True}
+
+    if event_type == "payment.captured":
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        order_id = payment.get("order_id")
+        payment_id = payment.get("id")
+        amount_paise = payment.get("amount", 0)
+        institute_id = payment.get("notes", {}).get("institute_id")
+
+        if institute_id and order_id:
+            sub = await db.subscriptions.find_one({
+                "instituteId": institute_id,
+                "razorpayOrderId": order_id,
+            })
+
+            if sub:
+                expected_paise = int(sub.get("amount", 0) * 100)
+
+                if amount_paise >= expected_paise:
+                    renews_at = (
+                        datetime.now(timezone.utc)
+                        + timedelta(days=365 if sub.get("billingCycle") == "yearly" else 30)
+                    ).isoformat()
+
+                    await db.subscriptions.update_one(
+                        {"_id": sub["_id"]},
+                        {"$set": {
+                            "status": "active",
+                            "razorpayPaymentId": payment_id,
+                            "activatedAt": now_iso(),
+                            "renewsAt": renews_at,
+                        }},
+                    )
+
+                    await db.institutes.update_one(
+                        {"id": institute_id},
+                        {"$set": {"subscriptionStatus": "active"}},
+                    )
+
+                    await db.institute_plans.update_one(
+                        {"instituteId": institute_id},
+                        {"$set": {
+                            "plan": sub.get("planType", "standard"),
+                            "updatedAt": now_iso(),
+                        }},
+                        upsert=True,
+                    )
+
+    elif event_type == "payment.failed":
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        order_id = payment.get("order_id")
+        institute_id = payment.get("notes", {}).get("institute_id")
+
+        if institute_id and order_id:
+            await db.subscriptions.update_one(
+                {"instituteId": institute_id, "razorpayOrderId": order_id},
+                {"$set": {"status": "payment_failed", "failedAt": now_iso()}},
+            )
+
+    return {"ok": True}
+
+
+@api.post("/institute/select-plan")
+async def select_plan(data: SelectPlanReq, user=Depends(auth)):
+    iid = data.institute_id
+
+    if user.get("instituteId") != iid:
+        raise HTTPException(403, "Access denied.")
+
+    if data.payment_mode == "razorpay":
+        if not rzp_client:
+            raise HTTPException(503, "Payment gateway not configured.")
+
+        if not data.razorpay_payment_id or not data.razorpay_order_id or not data.razorpay_signature:
+            raise HTTPException(400, "Missing Razorpay payment details.")
+
+        try:
+            rzp_client.utility.verify_payment_signature({
+                "razorpay_order_id": data.razorpay_order_id,
+                "razorpay_payment_id": data.razorpay_payment_id,
+                "razorpay_signature": data.razorpay_signature,
+            })
+
+            payment = rzp_client.payment.fetch(data.razorpay_payment_id)
+            if payment.get("status") not in ("captured", "authorized"):
+                raise HTTPException(402, "Payment not completed.")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Razorpay verification failed: {e}")
+            raise HTTPException(402, "Payment verification failed.")
+
+        subscription_status = "active"
+
+    elif data.payment_mode == "cash":
+        subscription_status = "pending_approval"
+
+    else:
+        raise HTTPException(400, "payment_mode must be 'razorpay' or 'cash'.")
+
+    sub = {
+        "id": uid(),
+        "instituteId": iid,
+        "planType": data.plan_type,
+        "addons": data.addons,
+        "billingCycle": data.billing_cycle,
+        "amount": data.amount,
+        "paymentMode": data.payment_mode,
+        "status": subscription_status,
+        "createdAt": now_iso(),
+        "renewsAt": (
+            datetime.now(timezone.utc) + timedelta(days=365 if data.billing_cycle == "yearly" else 30)
+        ).isoformat() if subscription_status == "active" else None,
+    }
+
+    if data.payment_mode == "razorpay":
+        sub["razorpayPaymentId"] = data.razorpay_payment_id
+        sub["razorpayOrderId"] = data.razorpay_order_id
+
+    sub_update = {k: v for k, v in sub.items() if k not in ("id", "createdAt")}
+
+    try:
+        await db.subscriptions.update_one(
+            (
+                {"instituteId": iid, "razorpayOrderId": data.razorpay_order_id}
+                if data.payment_mode == "razorpay"
+                else {"instituteId": iid, "status": "pending_approval", "paymentMode": "cash"}
+            ),
+            {
+                "$set": sub_update,
+                "$setOnInsert": {"id": sub["id"], "createdAt": sub["createdAt"]},
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        existing = await db.subscriptions.find_one(
+            {"razorpayPaymentId": data.razorpay_payment_id},
+            {"_id": 0},
+        )
+        updated_inst = await db.institutes.find_one({"id": iid}, {"_id": 0})
+        return {
+            "activated": True,
+            "status": "active",
+            "subscriptionId": existing["id"] if existing else "",
+            "institute": updated_inst,
+        }
+
+    await db.institutes.update_one(
+        {"id": iid},
+        {"$set": {
+            "subscriptionStatus": subscription_status,
+            "plan": data.plan_type,
+            "addons": data.addons,
+            "billingCycle": data.billing_cycle,
+        }},
+    )
+
+    if subscription_status == "active":
+        await db.institute_plans.update_one(
+            {"instituteId": iid},
+            {"$set": {"plan": data.plan_type, "updatedAt": now_iso()}},
+            upsert=True,
+        )
+
+    updated_inst = await db.institutes.find_one({"id": iid}, {"_id": 0})
+
+    return {
+        "activated": subscription_status == "active",
+        "status": subscription_status,
+        "subscriptionId": sub["id"],
+        "institute": updated_inst,
+    }
+
+
+
+@api.post("/admin/approve-institute")
+async def approve_institute(data: ApprovalReq, user=Depends(auth)):
+    if user.get("role") != "superadmin":
+        raise HTTPException(403, "Super-admin only.")
+
+    action = data.action.lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be 'approve' or 'reject'.")
+
+    new_status = "active" if action == "approve" else "rejected"
+
+    await db.institutes.update_one(
+        {"id": data.institute_id},
+        {"$set": {"subscriptionStatus": new_status}},
+    )
+
+    await db.subscriptions.update_one(
+        {"instituteId": data.institute_id, "status": "pending_approval"},
+        {"$set": {
+            "status": new_status,
+            "approvalNote": data.note,
+            "approvedAt": now_iso(),
+        }},
+    )
+
+    if new_status == "active":
+        inst = await db.institutes.find_one({"id": data.institute_id}, {"_id": 0})
+        if inst:
+            await db.institute_plans.update_one(
+                {"instituteId": data.institute_id},
+                {"$set": {"plan": inst.get("plan", "standard"), "updatedAt": now_iso()}},
+                upsert=True,
+            )
+
+    return {"ok": True, "status": new_status}
+
+
+@api.get("/admin/pending-approvals")
+async def list_pending_approvals(user=Depends(auth)):
+    if user.get("role") != "superadmin":
+        raise HTTPException(403, "Super-admin only.")
+
+    insts = await db.institutes.find(
+        {"subscriptionStatus": "pending_approval"},
+        {"_id": 0},
+    ).sort("createdAt", -1).to_list(100)
+
+    for inst in insts:
+        inst["subscription"] = await db.subscriptions.find_one(
+            {"instituteId": inst["id"], "status": "pending_approval"},
+            {"_id": 0},
+        )
+
+    return insts
+
+
+
+
+
 
 
 # ─── Models ───
@@ -258,7 +1376,12 @@ async def get_institute_plan(institute_id):
         return "standard"
     return plan.get("plan", "standard")
 
+def _safe_user(u: dict):
+    return {k: v for k, v in u.items() if k not in ("passwordHash", "_id")}
 
+def _resolve_slug(request: Request, body_slug: str = None):
+    header = request.headers.get("X-Institute-Slug", "").strip().lower()
+    return header or (body_slug.strip().lower() if body_slug else None)
 # ─── AUTH ───
 
 @api.post("/auth/register")
@@ -280,16 +1403,42 @@ async def register(data: UserRegister):
 
 @api.post("/auth/login")
 async def login(data: UserLogin):
-    u = await db.users.find_one({"email": data.email}, {"_id": 0})
+    email = data.email.strip().lower()
+
+    u = await db.users.find_one({"email": email}, {"_id": 0})
+
     if not u or not check_pw(data.password, u["passwordHash"]):
-        raise HTTPException(401, "Invalid credentials")
-    token = make_token(u["id"], u["role"], u["instituteId"])
-    return {"token": token, "user": {k: v for k, v in u.items() if k != "passwordHash"}}
+        raise HTTPException(401, "Invalid email or password.")
+
+    if u.get("role") not in ("admin", "superadmin"):
+        raise HTTPException(403, "Only admin can login from main domain")
+
+
+    iid = u.get("instituteId", "")
+    
+
+    institute = None
+    if iid:
+        institute = await db.institutes.find_one({"id": iid}, {"_id": 0})
+
+    slug = institute["slug"] if institute else None
+    token = make_token(u["id"], u["role"], iid, slug)
+
+    return {
+        "token": token,
+        "user": _safe_user(u),
+        "institute": institute
+    }
+
+
+@api.post("/auth/admin-login")
+async def admin_login_alias(data: UserLogin):
+    return await login(data)
 
 
 @api.get("/auth/me")
 async def me(user=Depends(auth)):
-    return {k: v for k, v in user.items() if k != "passwordHash"}
+    return _safe_user(user)
 
 
 # ─── DASHBOARD ───
@@ -308,126 +1457,157 @@ async def dashboard_stats(user=Depends(auth)):
 
 async def _admin_dashboard(user):
     iid = user["instituteId"]
-    students = await db.students.count_documents({"instituteId": iid})
-    teachers = await db.teachers.count_documents({"instituteId": iid})
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_day  = datetime.now(timezone.utc).strftime("%A")
 
-    fees = await db.student_fees.find({"instituteId": iid}, {"_id": 0}).to_list(1000)
-    total_paid = sum(f.get("totalPaid", 0) for f in fees)
+    # ── 1. All independent queries in parallel ────────────────────────────
+    (
+        student_count,
+        teacher_count,
+        fees,
+        att_agg,
+        today_att_agg,
+        batches,
+        notifs,
+        announcements,
+    ) = await asyncio.gather(
+        db.students.count_documents({"instituteId": iid}),
+        db.teachers.count_documents({"instituteId": iid}),
+        db.student_fees.find(
+            {"instituteId": iid},
+            {"_id": 0, "totalPaid": 1, "totalPending": 1, "installments": 1, "studentId": 1},
+        ).to_list(2000),
+        db.attendance.aggregate([
+            {"$match": {"instituteId": iid}},
+            {"$group": {
+                "_id":     None,
+                "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
+                "total":   {"$sum": 1},
+            }},
+        ]).to_list(1),
+        db.attendance.aggregate([
+            {"$match": {"instituteId": iid, "date": today_str}},
+            {"$group": {
+                "_id":     None,
+                "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
+                "total":   {"$sum": 1},
+            }},
+        ]).to_list(1),
+        db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(200),
+        db.notifications.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5),
+        db.announcements.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5),
+    )
+
+    # ── 2. Compute fee totals (Python, no extra DB hits) ──────────────────
+    total_paid    = sum(f.get("totalPaid", 0)    for f in fees)
     total_pending = sum(f.get("totalPending", 0) for f in fees)
 
-    att = await db.attendance.find({"instituteId": iid}, {"_id": 0}).to_list(10000)
-    present = sum(1 for a in att if a.get("status") in ("present", "late"))
-    att_rate = round(present / len(att) * 100, 1) if att else 0
-
-    monthly = {}
+    monthly: dict = {}
     for f in fees:
         for inst in f.get("installments", []):
-            if inst.get("paidDate"):
-                m = inst["paidDate"][:7]
+            pd = inst.get("paidDate")
+            if pd:
+                m = pd[:7]
                 monthly[m] = monthly.get(m, 0) + inst.get("paidAmount", 0)
 
-    today_day = datetime.now(timezone.utc).strftime("%A")
-    batches = await db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(100)
+    # ── 3. Attendance rates from aggregation results ───────────────────────
+    att_r = att_agg[0] if att_agg else {"present": 0, "total": 0}
+    att_rate = round(att_r["present"] / att_r["total"] * 100, 1) if att_r["total"] else 0
+
+    today_r = today_att_agg[0] if today_att_agg else {"present": 0, "total": 0}
+    today_att_rate = round(today_r["present"] / today_r["total"] * 100, 1) if today_r["total"] else 0
+
+    # ── 4. Today's classes (pure Python — batches already fetched) ─────────
     today_classes = [b for b in batches if today_day in b.get("scheduleDays", [])]
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # ── 5. Dues today — bulk student fetch, no loop queries ───────────────
+    due_student_ids = [
+        f["studentId"]
+        for f in fees
+        for inst in f.get("installments", [])
+        if inst.get("dueDate", "")[:10] == today_str and inst.get("status") != "paid"
+    ]
+    students_map = await _get_students_map(iid, due_student_ids) if due_student_ids else {}
+
     dues_today = []
     for f in fees:
+        if len(dues_today) >= 5:
+            break
         for inst in f.get("installments", []):
             if inst.get("dueDate", "")[:10] == today_str and inst.get("status") != "paid":
-                student = await db.students.find_one({"id": f["studentId"], "instituteId": iid}, {"_id": 0})
-                if student:
-                    dues_today.append({"studentName": student.get("name", ""), "amount": inst.get("amount", 0), "studentId": f["studentId"]})
-
-    notifs = await db.notifications.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5)
-
-    # Latest announcements
-    announcements = await db.announcements.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5)
-
-    # Today's attendance %
-    today_att = await db.attendance.find({"instituteId": iid, "date": today_str}, {"_id": 0}).to_list(5000)
-    today_present = sum(1 for a in today_att if a["status"] in ("present", "late"))
-    today_att_rate = round(today_present / len(today_att) * 100, 1) if today_att else 0
+                s = students_map.get(f["studentId"], {})
+                if s:
+                    dues_today.append({
+                        "studentName": s.get("name", ""),
+                        "amount":      inst.get("amount", 0),
+                        "studentId":   f["studentId"],
+                    })
+                break
 
     return {
-        "role": "admin",
-        "totalStudents": students, "totalTeachers": teachers,
-        "monthlyRevenue": total_paid, "pendingRevenue": total_pending,
-        "attendanceRate": att_rate, "todayAttendanceRate": today_att_rate,
-        "monthlyFees": monthly,
-        "todayClasses": today_classes[:5], "dueToday": dues_today[:5],
-        "notifications": notifs, "totalBatches": len(batches),
-        "announcements": announcements
+        "role":               "admin",
+        "totalStudents":      student_count,
+        "totalTeachers":      teacher_count,
+        "monthlyRevenue":     total_paid,
+        "pendingRevenue":     total_pending,
+        "attendanceRate":     att_rate,
+        "todayAttendanceRate": today_att_rate,
+        "monthlyFees":        monthly,
+        "todayClasses":       today_classes[:5],
+        "dueToday":           dues_today[:5],
+        "notifications":      notifs,
+        "totalBatches":       len(batches),
+        "announcements":      announcements,
     }
 
 
-async def _teacher_dashboard(user):
-    iid = user["instituteId"]
-    batch_ids = await get_teacher_batch_ids(user)
-
-    batches = []
-    total_students = 0
-    for bid in batch_ids:
-        b = await db.batches.find_one({"id": bid, "instituteId": iid}, {"_id": 0})
-        if b:
-            sc = await db.students.count_documents({"batchId": bid, "instituteId": iid})
-            b["studentCount"] = sc
-            total_students += sc
-            batches.append(b)
-
-    today_day = datetime.now(timezone.utc).strftime("%A")
-    today_classes = [b for b in batches if today_day in b.get("scheduleDays", [])]
-
-    # Recent attendance for teacher's batches
-    att_q = {"instituteId": iid}
-    if batch_ids:
-        att_q["batchId"] = {"$in": batch_ids}
-    att = await db.attendance.find(att_q, {"_id": 0}).to_list(5000)
-    present = sum(1 for a in att if a.get("status") in ("present", "late"))
-    att_rate = round(present / len(att) * 100, 1) if att else 0
-
-    # Upcoming tests
-    test_q = {"instituteId": iid}
-    if batch_ids:
-        test_q["batchId"] = {"$in": batch_ids}
-    tests = await db.tests.find(test_q, {"_id": 0}).sort("testDate", -1).to_list(5)
-    for t in tests:
-        batch = await db.batches.find_one({"id": t.get("batchId", "")}, {"_id": 0})
-        t["batchName"] = batch["batchName"] if batch else ""
-
-    notifs = await db.notifications.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5)
-
-    return {
-        "role": "teacher",
-        "myBatches": batches,
-        "totalStudents": total_students,
-        "todayClasses": today_classes,
-        "attendanceRate": att_rate,
-        "recentTests": tests,
-        "notifications": notifs,
-        "totalBatches": len(batches)
-    }
-
+    
 
 async def _student_dashboard(user):
     iid = user["instituteId"]
     sid = user.get("studentId", "")
 
-    student = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
-    batch = None
-    if student:
-        batch = await db.batches.find_one({"id": student.get("batchId", "")}, {"_id": 0})
+    # ── All independent queries in parallel ───────────────────────────────
+    student, att_agg, fees, marks, notifs = await asyncio.gather(
+        db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0}),
+        db.attendance.aggregate([
+            {"$match": {"studentId": sid, "instituteId": iid}},
+            {"$group": {
+                "_id":     None,
+                "present": {"$sum": {"$cond": [{"$eq": ["$status", "present"]}, 1, 0]}},
+                "late":    {"$sum": {"$cond": [{"$eq": ["$status", "late"]},    1, 0]}},
+                "absent":  {"$sum": {"$cond": [{"$eq": ["$status", "absent"]},  1, 0]}},
+                "total":   {"$sum": 1},
+            }},
+        ]).to_list(1),
+        db.student_fees.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(10),
+        db.marks.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(100),
+        db.notifications.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5),
+    )
 
-    # Attendance summary
-    att = await db.attendance.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(5000)
-    present = sum(1 for a in att if a.get("status") in ("present", "late"))
-    absent = sum(1 for a in att if a.get("status") == "absent")
-    att_rate = round(present / len(att) * 100, 1) if att else 0
+    # ── Batch + tests in second parallel round (depends on student) ───────
+    batch_id = student.get("batchId", "") if student else ""
+    test_ids  = [m["testId"] for m in marks]
 
-    # Fee status
-    fees = await db.student_fees.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(10)
-    total_fee = sum(f.get("totalFee", 0) for f in fees)
-    total_paid = sum(f.get("totalPaid", 0) for f in fees)
+    async def _none():
+        return None
+
+    batch, tests_raw, announcements = await asyncio.gather(
+        db.batches.find_one({"id": batch_id}, {"_id": 0}) if batch_id else _none(),
+        db.tests.find({"id": {"$in": test_ids}}, {"_id": 0}).to_list(100) if test_ids else _none(),
+        db.announcements.find(
+            {"instituteId": iid, "$or": [{"targetBatchId": ""}, {"targetBatchId": batch_id}]},
+            {"_id": 0},
+        ).sort("createdAt", -1).to_list(5),
+    )
+
+    # ── Attendance summary ────────────────────────────────────────────────
+    att_r = att_agg[0] if att_agg else {"present": 0, "late": 0, "absent": 0, "total": 0}
+    att_rate = round((att_r["present"] + att_r.get("late", 0)) / att_r["total"] * 100, 1) if att_r["total"] else 0
+
+    # ── Fee summary ───────────────────────────────────────────────────────
+    total_fee     = sum(f.get("totalFee",     0) for f in fees)
+    total_paid    = sum(f.get("totalPaid",    0) for f in fees)
     total_pending = sum(f.get("totalPending", 0) for f in fees)
     next_due = None
     for f in fees:
@@ -438,35 +1618,42 @@ async def _student_dashboard(user):
         if next_due:
             break
 
-    # Recent test results
-    marks = await db.marks.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(100)
+    # ── Test results (use map — no per-mark DB call) ──────────────────────
+    tests_map = {t["id"]: t for t in (tests_raw or [])}
     test_results = []
     for m in marks:
-        test = await db.tests.find_one({"id": m["testId"]}, {"_id": 0})
+        test = tests_map.get(m["testId"])
         if test:
+            max_m = test["maximumMarks"]
             test_results.append({
-                "testName": test["testName"], "subject": test.get("subject", ""),
-                "marksObtained": m["marksObtained"], "maximumMarks": test["maximumMarks"],
-                "percentage": round(m["marksObtained"] / test["maximumMarks"] * 100, 1) if test["maximumMarks"] else 0,
-                "testDate": test.get("testDate", "")
+                "testName":      test["testName"],
+                "subject":       test.get("subject", ""),
+                "marksObtained": m["marksObtained"],
+                "maximumMarks":  max_m,
+                "percentage":    round(m["marksObtained"] / max_m * 100, 1) if max_m else 0,
+                "testDate":      test.get("testDate", ""),
             })
 
-    notifs = await db.notifications.find({"instituteId": iid}, {"_id": 0}).sort("createdAt", -1).to_list(5)
-
-    # Announcements for student (all + their batch)
-    ann_q = {"instituteId": iid, "$or": [{"targetBatchId": ""}, {"targetBatchId": student.get("batchId", "") if student else ""}]}
-    announcements = await db.announcements.find(ann_q, {"_id": 0}).sort("createdAt", -1).to_list(5)
-
     return {
-        "role": "student",
+        "role":    "student",
         "student": student,
-        "batch": batch,
-        "attendanceSummary": {"present": present, "absent": absent, "total": len(att), "rate": att_rate},
-        "feeSummary": {"totalFee": total_fee, "totalPaid": total_paid, "totalPending": total_pending, "nextDue": next_due},
-        "testResults": test_results,
+        "batch":   batch,
+        "attendanceSummary": {
+            "present": att_r["present"],
+            "absent":  att_r["absent"],
+            "total":   att_r["total"],
+            "rate":    att_rate,
+        },
+        "feeSummary": {
+            "totalFee":     total_fee,
+            "totalPaid":    total_paid,
+            "totalPending": total_pending,
+            "nextDue":      next_due,
+        },
+        "testResults":   test_results,
         "notifications": notifs,
-        "fees": fees,
-        "announcements": announcements
+        "fees":          fees,
+        "announcements": announcements,
     }
 
 
@@ -536,7 +1723,7 @@ async def bulk_upload_students(file: UploadFile = File(...), user=Depends(admin_
     reader = csv.DictReader(io.StringIO(text))
     iid = user["instituteId"]
 
-    # Pre-load batches for name->id lookup
+    # Pre-load async def _teacher_dashboard(user):batches for name->id lookup
     all_batches = await db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(200)
     batch_map = {b["batchName"].strip().lower(): b["id"] for b in all_batches}
 
@@ -704,29 +1891,55 @@ async def bulk_upload_teachers(file: UploadFile = File(...), user=Depends(admin_
 
 # ─── BATCHES ───
 
+
+
+# NEW — two bulk queries, zero loop DB calls
 @api.get("/batches")
 async def list_batches(user=Depends(auth)):
     iid = user["instituteId"]
-    # Teachers see only their batches
+
     if user["role"] == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
         if not batch_ids:
             return []
-        batches = await db.batches.find({"id": {"$in": batch_ids}, "instituteId": iid}, {"_id": 0}).to_list(100)
+        batches = await db.batches.find(
+            {"id": {"$in": batch_ids}, "instituteId": iid}, {"_id": 0}
+        ).to_list(100)
     elif user["role"] == "student":
-        student = await db.students.find_one({"id": user.get("studentId", ""), "instituteId": iid}, {"_id": 0})
+        student = await db.students.find_one(
+            {"id": user.get("studentId", ""), "instituteId": iid}, {"_id": 0}
+        )
         if student and student.get("batchId"):
-            batches = await db.batches.find({"id": student["batchId"], "instituteId": iid}, {"_id": 0}).to_list(1)
+            batches = await db.batches.find(
+                {"id": student["batchId"], "instituteId": iid}, {"_id": 0}
+            ).to_list(1)
         else:
             return []
     else:
-        batches = await db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(100)
-    for b in batches:
-        b["studentCount"] = await db.students.count_documents({"batchId": b["id"], "instituteId": iid})
-        teacher = await db.teachers.find_one({"id": b.get("teacherId", "")}, {"_id": 0})
-        b["teacherName"] = teacher["name"] if teacher else ""
-    return batches
+        batches = await db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(200)
 
+    if not batches:
+        return []
+
+    bid_list = [b["id"] for b in batches]
+    tid_list = [b.get("teacherId", "") for b in batches if b.get("teacherId")]
+
+    # Parallel: student counts per batch + teacher lookup
+    count_agg, teachers_map = await asyncio.gather(
+        db.students.aggregate([
+            {"$match": {"batchId": {"$in": bid_list}, "instituteId": iid}},
+            {"$group": {"_id": "$batchId", "count": {"$sum": 1}}},
+        ]).to_list(200),
+        _get_teachers_map(iid, tid_list),
+    )
+
+    count_map = {r["_id"]: r["count"] for r in count_agg}
+
+    for b in batches:
+        b["studentCount"] = count_map.get(b["id"], 0)
+        b["teacherName"]  = teachers_map.get(b.get("teacherId", ""), {}).get("name", "")
+
+    return batches
 
 @api.post("/batches")
 async def create_batch(data: BatchCreate, user=Depends(admin_only)):
@@ -751,26 +1964,49 @@ async def delete_batch(bid: str, user=Depends(admin_only)):
 
 # ─── ATTENDANCE ───
 
-@api.post("/attendance/mark")
-async def mark_attendance(data: AttendanceMark, user=Depends(teacher_or_admin)):
-    iid = user["instituteId"]
-    for r in data.records:
-        existing = await db.attendance.find_one({
-            "studentId": r["studentId"], "batchId": data.batchId,
-            "date": data.date, "instituteId": iid
-        })
-        if existing:
-            await db.attendance.update_one({"_id": existing["_id"]}, {"$set": {"status": r["status"]}})
-        else:
-            await db.attendance.insert_one({
-                "id": uid(), "studentId": r["studentId"], "batchId": data.batchId,
-                "date": data.date, "status": r["status"], "instituteId": iid
-            })
 
-    # Absent alert system — fire for absent students, dedup per student per day
+
+@api.post("/attendance/mark")
+async def mark_attendance(
+    data: AttendanceMark,
+    background_tasks: BackgroundTasks,
+    user=Depends(teacher_or_admin)
+):
+    iid = user["instituteId"]
+
+    operations = []
+
+    for r in data.records:
+        operations.append(
+            UpdateOne(
+                {
+                    "studentId": r["studentId"],
+                    "batchId": data.batchId,
+                    "date": data.date,
+                    "instituteId": iid
+                },
+                {
+                    "$set": {"status": r["status"]},
+                    "$setOnInsert": {"id": uid()}
+                },
+                upsert=True
+            )
+        )
+
+    if operations:
+        await db.attendance.bulk_write(operations)
+
+    # 🚀 BACKGROUND TASK (UNCHANGED)
     absent_ids = [r["studentId"] for r in data.records if r["status"] == "absent"]
+
     if absent_ids:
-        asyncio.create_task(_send_absent_alerts(absent_ids, data.batchId, data.date, iid))
+        background_tasks.add_task(
+            _send_absent_alerts,
+            absent_ids,
+            data.batchId,
+            data.date,
+            iid
+        )
 
     return {"ok": True}
 
@@ -863,7 +2099,7 @@ async def get_attendance(user=Depends(auth), batchId: str = "", date: str = "", 
         q["date"] = date
     if studentId and user["role"] != "student":
         q["studentId"] = studentId
-    return await db.attendance.find(q, {"_id": 0}).to_list(10000)
+    return await db.attendance.find(q, {"_id": 0}).to_list(1000)
 
 
 # ─── FEES ───
@@ -901,9 +2137,12 @@ async def _assign_student_fee(student_id, fee_structure, institute_id):
 @api.get("/fee-structures")
 async def list_fee_structures(user=Depends(auth)):
     fss = await db.fee_structures.find({"instituteId": user["instituteId"]}, {"_id": 0}).to_list(100)
+    batch_ids = [fs.get("batchId", "") for fs in fss]
+
+    batches_map = await _get_batches_map(user["instituteId"], batch_ids)
+
     for fs in fss:
-        batch = await db.batches.find_one({"id": fs.get("batchId", "")}, {"_id": 0})
-        fs["batchName"] = batch["batchName"] if batch else ""
+        fs["batchName"] = batches_map.get(fs.get("batchId", ""), {}).get("batchName", "")
     return fss
 
 
@@ -928,7 +2167,10 @@ async def assign_fee(data: FeeAssign, user=Depends(admin_only)):
 
 @api.get("/student-fees")
 async def list_student_fees(user=Depends(auth), studentId: str = "", batchId: str = ""):
-    q = {"instituteId": user["instituteId"]}
+    iid = user["instituteId"]
+
+    q = {"instituteId": iid}
+
     if user["role"] == "student":
         q["studentId"] = user.get("studentId", "")
     else:
@@ -936,12 +2178,26 @@ async def list_student_fees(user=Depends(auth), studentId: str = "", batchId: st
             q["studentId"] = studentId
         if batchId:
             q["batchId"] = batchId
+
     fees = await db.student_fees.find(q, {"_id": 0}).to_list(1000)
+
+    if not fees:
+        return []
+
+    # 🔥 BULK FETCH
+    student_ids = list({f["studentId"] for f in fees})
+    batch_ids = list({f.get("batchId", "") for f in fees})
+
+    students_map, batches_map = await asyncio.gather(
+        _get_students_map(iid, student_ids),
+        _get_batches_map(iid, batch_ids),
+    )
+
+    # 🚀 NO DB CALLS INSIDE LOOP
     for f in fees:
-        student = await db.students.find_one({"id": f["studentId"]}, {"_id": 0})
-        f["studentName"] = student["name"] if student else ""
-        batch = await db.batches.find_one({"id": f.get("batchId", "")}, {"_id": 0})
-        f["batchName"] = batch["batchName"] if batch else ""
+        f["studentName"] = students_map.get(f["studentId"], {}).get("name", "")
+        f["batchName"] = batches_map.get(f.get("batchId", ""), {}).get("batchName", "")
+
     return fees
 
 
@@ -977,7 +2233,9 @@ async def pay_fee(data: FeePaymentReq, user=Depends(admin_only)):
 
 @api.get("/tests")
 async def list_tests(user=Depends(auth), batchId: str = ""):
-    q = {"instituteId": user["instituteId"]}
+    iid = user["instituteId"]
+    q = {"instituteId": iid}
+
     if user["role"] == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
         if batchId and batchId in batch_ids:
@@ -986,20 +2244,46 @@ async def list_tests(user=Depends(auth), batchId: str = ""):
             q["batchId"] = {"$in": batch_ids}
         else:
             return []
+
     elif user["role"] == "student":
-        student = await db.students.find_one({"id": user.get("studentId", ""), "instituteId": user["instituteId"]}, {"_id": 0})
+        student = await db.students.find_one(
+            {"id": user.get("studentId", ""), "instituteId": iid},
+            {"_id": 0}
+        )
         if student and student.get("batchId"):
             q["batchId"] = student["batchId"]
         else:
             return []
+
     else:
         if batchId:
             q["batchId"] = batchId
+
     tests = await db.tests.find(q, {"_id": 0}).to_list(100)
+
+    if not tests:
+        return []
+
+    # 🔥 BULK FETCH BATCHES
+    batch_ids = list({t.get("batchId", "") for t in tests})
+
+    # 🔥 BULK COUNT MARKS
+    test_ids = [t["id"] for t in tests]
+
+    batches_map, marks_agg = await asyncio.gather(
+        _get_batches_map(iid, batch_ids),
+        db.marks.aggregate([
+            {"$match": {"testId": {"$in": test_ids}}},
+            {"$group": {"_id": "$testId", "count": {"$sum": 1}}},
+        ]).to_list(100),
+    )
+
+    marks_map = {m["_id"]: m["count"] for m in marks_agg}
+
     for t in tests:
-        batch = await db.batches.find_one({"id": t.get("batchId", "")}, {"_id": 0})
-        t["batchName"] = batch["batchName"] if batch else ""
-        t["marksCount"] = await db.marks.count_documents({"testId": t["id"]})
+        t["batchName"] = batches_map.get(t.get("batchId", ""), {}).get("batchName", "")
+        t["marksCount"] = marks_map.get(t["id"], 0)
+
     return tests
 
 
@@ -1060,77 +2344,106 @@ async def get_test_results(test_id: str, user=Depends(auth)):
 # ─── REPORTS ───
 
 @api.get("/reports/attendance")
-async def attendance_report(user=Depends(auth), batchId: str = "", startDate: str = "", endDate: str = ""):
+async def attendance_report(
+    user=Depends(auth),
+    batchId: str = "",
+    startDate: str = "",
+    endDate: str = "",
+):
     iid = user["instituteId"]
-    q = {"instituteId": iid}
+
+    # ── 1. Build match stage ──────────────────────────────────────────────
+    match: dict = {"instituteId": iid}
     if batchId:
-        q["batchId"] = batchId
+        match["batchId"] = batchId
     if startDate or endDate:
-        date_q = {}
+        date_q: dict = {}
         if startDate:
             date_q["$gte"] = startDate
         if endDate:
             date_q["$lte"] = endDate
-        if date_q:
-            q["date"] = date_q
-    records = await db.attendance.find(q, {"_id": 0}).to_list(10000)
+        match["date"] = date_q
 
-    # Student-wise attendance
-    student_att = {}
-    for r in records:
-        sid = r["studentId"]
-        if sid not in student_att:
-            student_att[sid] = {"present": 0, "absent": 0, "late": 0, "total": 0}
-        student_att[sid]["total"] += 1
-        if r["status"] == "present":
-            student_att[sid]["present"] += 1
-        elif r["status"] == "late":
-            student_att[sid]["late"] += 1
-        else:
-            student_att[sid]["absent"] += 1
+    # ── 2. Run all three aggregations in PARALLEL ─────────────────────────
+    student_pipeline = [
+        {"$match": match},
+        {"$group": {
+            "_id": "$studentId",
+            "present": {"$sum": {"$cond": [{"$eq": ["$status", "present"]}, 1, 0]}},
+            "late":    {"$sum": {"$cond": [{"$eq": ["$status", "late"]},    1, 0]}},
+            "absent":  {"$sum": {"$cond": [{"$eq": ["$status", "absent"]},  1, 0]}},
+            "total":   {"$sum": 1},
+        }},
+    ]
+
+    batch_pipeline = [
+        {"$match": match},
+        {"$group": {
+            "_id": "$batchId",
+            "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
+            "total":   {"$sum": 1},
+        }},
+    ]
+
+    trend_pipeline = [
+        {"$match": match},
+        {"$group": {
+            "_id":     {"$substr": ["$date", 0, 7]},   # YYYY-MM
+            "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
+            "total":   {"$sum": 1},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+
+    student_agg, batch_agg, trend_agg = await asyncio.gather(
+        db.attendance.aggregate(student_pipeline).to_list(5000),
+        db.attendance.aggregate(batch_pipeline).to_list(500),
+        db.attendance.aggregate(trend_pipeline).to_list(100),
+    )
+
+    # ── 3. Bulk-fetch names (single query each, no loops) ─────────────────
+    sid_list = [r["_id"] for r in student_agg]
+    bid_list = [r["_id"] for r in batch_agg]
+
+    students_map, batches_map = await asyncio.gather(
+        _get_students_map(iid, sid_list),
+        _get_batches_map(iid, bid_list),
+    )
+
+    # ── 4. Assemble response (no DB calls inside these loops) ─────────────
     summaries = []
-    for sid, data in student_att.items():
-        student = await db.students.find_one({"id": sid}, {"_id": 0})
-        rate = round((data["present"] + data["late"]) / data["total"] * 100, 1) if data["total"] > 0 else 0
+    for r in student_agg:
+        sid = r["_id"]
+        total = r["total"]
+        rate = round((r["present"] + r["late"]) / total * 100, 1) if total else 0
         summaries.append({
-            "studentId": sid, "studentName": student["name"] if student else "",
-            "present": data["present"], "late": data["late"], "absent": data["absent"], "total": data["total"], "rate": rate
+            "studentId":   sid,
+            "studentName": students_map.get(sid, {}).get("name", ""),
+            "present":     r["present"],
+            "late":        r["late"],
+            "absent":      r["absent"],
+            "total":       total,
+            "rate":        rate,
         })
 
-    # Batch-wise attendance
-    batch_att = {}
-    for r in records:
-        bid = r["batchId"]
-        if bid not in batch_att:
-            batch_att[bid] = {"present": 0, "total": 0}
-        batch_att[bid]["total"] += 1
-        if r["status"] in ("present", "late"):
-            batch_att[bid]["present"] += 1
     batch_summaries = []
-    for bid, data in batch_att.items():
-        batch = await db.batches.find_one({"id": bid}, {"_id": 0})
-        rate = round(data["present"] / data["total"] * 100, 1) if data["total"] > 0 else 0
+    for r in batch_agg:
+        bid = r["_id"]
+        total = r["total"]
+        rate = round(r["present"] / total * 100, 1) if total else 0
         batch_summaries.append({
-            "batchId": bid, "batchName": batch["batchName"] if batch else "",
-            "present": data["present"], "total": data["total"], "rate": rate
+            "batchId":   bid,
+            "batchName": batches_map.get(bid, {}).get("batchName", ""),
+            "present":   r["present"],
+            "total":     total,
+            "rate":      rate,
         })
 
-    # Monthly trend data
-    monthly_trend = {}
-    for r in records:
-        month = r.get("date", "")[:7]  # YYYY-MM
-        if not month:
-            continue
-        if month not in monthly_trend:
-            monthly_trend[month] = {"present": 0, "total": 0}
-        monthly_trend[month]["total"] += 1
-        if r["status"] in ("present", "late"):
-            monthly_trend[month]["present"] += 1
     trend = []
-    for m in sorted(monthly_trend.keys()):
-        d = monthly_trend[m]
-        rate = round(d["present"] / d["total"] * 100, 1) if d["total"] > 0 else 0
-        trend.append({"month": m, "present": d["present"], "total": d["total"], "rate": rate})
+    for r in trend_agg:
+        total = r["total"]
+        rate = round(r["present"] / total * 100, 1) if total else 0
+        trend.append({"month": r["_id"], "present": r["present"], "total": total, "rate": rate})
 
     return {"students": summaries, "batches": batch_summaries, "monthlyTrend": trend}
 
@@ -1138,49 +2451,106 @@ async def attendance_report(user=Depends(auth), batchId: str = "", startDate: st
 @api.get("/reports/fees")
 async def fees_report(user=Depends(auth), batchId: str = ""):
     iid = user["instituteId"]
-    q = {"instituteId": iid}
+    q: dict = {"instituteId": iid}
     if batchId:
         q["batchId"] = batchId
-    fees = await db.student_fees.find(q, {"_id": 0}).to_list(1000)
-    total_collected = sum(f.get("totalPaid", 0) for f in fees)
-    total_pending = sum(f.get("totalPending", 0) for f in fees)
-    total_fee = sum(f.get("totalFee", 0) for f in fees)
-    batch_fees = {}
-    for f in fees:
-        bid = f.get("batchId", "")
-        if bid not in batch_fees:
-            batch_fees[bid] = {"collected": 0, "pending": 0, "total": 0}
-        batch_fees[bid]["collected"] += f.get("totalPaid", 0)
-        batch_fees[bid]["pending"] += f.get("totalPending", 0)
-        batch_fees[bid]["total"] += f.get("totalFee", 0)
-    batch_summaries = []
-    for bid, data in batch_fees.items():
-        batch = await db.batches.find_one({"id": bid}, {"_id": 0})
-        batch_summaries.append({"batchId": bid, "batchName": batch["batchName"] if batch else "", **data})
+
+    # ── 1. Aggregate totals per batch + overall in ONE pass ───────────────
+    batch_pipeline = [
+        {"$match": q},
+        {"$group": {
+            "_id":       "$batchId",
+            "collected": {"$sum": "$totalPaid"},
+            "pending":   {"$sum": "$totalPending"},
+            "total":     {"$sum": "$totalFee"},
+        }},
+    ]
+
+    overall_pipeline = [
+        {"$match": q},
+        {"$group": {
+            "_id":            None,
+            "totalCollected": {"$sum": "$totalPaid"},
+            "totalPending":   {"$sum": "$totalPending"},
+            "totalFee":       {"$sum": "$totalFee"},
+        }},
+    ]
+
+    # Fetch raw fees (capped) for overdue scan + trend; parallel with aggregations
+    fees_future = db.student_fees.find(q, {"_id": 0,
+        "studentId": 1, "totalPaid": 1, "totalPending": 1,
+        "totalFee": 1, "batchId": 1, "installments": 1,
+    }).to_list(2000)
+
+    batch_agg, overall_agg, fees = await asyncio.gather(
+        db.attendance.aggregate(batch_pipeline).to_list(500)
+        if False else db.student_fees.aggregate(batch_pipeline).to_list(500),
+        db.student_fees.aggregate(overall_pipeline).to_list(1),
+        fees_future,
+    )
+
+    # ── 2. Bulk-fetch names ───────────────────────────────────────────────
+    bid_list = list({r["_id"] for r in batch_agg})
+    sid_list = list({f["studentId"] for f in fees})
+
+    batches_map, students_map = await asyncio.gather(
+        _get_batches_map(iid, bid_list),
+        _get_students_map(iid, sid_list),
+    )
+
+    # ── 3. Assemble batch summaries ───────────────────────────────────────
+    batch_summaries = [
+        {
+            "batchId":   r["_id"],
+            "batchName": batches_map.get(r["_id"], {}).get("batchName", ""),
+            "collected": r["collected"],
+            "pending":   r["pending"],
+            "total":     r["total"],
+        }
+        for r in batch_agg
+    ]
+
+    overall = overall_agg[0] if overall_agg else {}
+
+    # ── 4. Overdue scan (Python, but no DB calls — maps already loaded) ───
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     overdue = []
     for f in fees:
+        if len(overdue) >= 20:
+            break
+        student = students_map.get(f["studentId"], {})
         for inst in f.get("installments", []):
-            if inst.get("status") != "paid" and inst.get("dueDate", "") < today:
-                student = await db.students.find_one({"id": f["studentId"]}, {"_id": 0})
+            due = inst.get("dueDate", "")
+            if inst.get("status") != "paid" and due and due < today:
                 overdue.append({
-                    "studentName": student["name"] if student else "",
-                    "amount": inst["amount"], "dueDate": inst["dueDate"], "studentId": f["studentId"]
+                    "studentName": student.get("name", ""),
+                    "amount":      inst["amount"],
+                    "dueDate":     due,
+                    "studentId":   f["studentId"],
                 })
+                break  # one overdue entry per student is enough for dashboard
 
-    # Monthly collection trend
-    monthly_collection = {}
+    # ── 5. Monthly collection trend ───────────────────────────────────────
+    monthly_collection: dict = {}
     for f in fees:
         for inst in f.get("installments", []):
-            if inst.get("paidDate"):
-                m = inst["paidDate"][:7]
+            pd = inst.get("paidDate")
+            if pd:
+                m = pd[:7]
                 monthly_collection[m] = monthly_collection.get(m, 0) + inst.get("paidAmount", 0)
-    collection_trend = [{"month": m, "collected": monthly_collection[m]} for m in sorted(monthly_collection.keys())]
+
+    collection_trend = [
+        {"month": m, "collected": monthly_collection[m]}
+        for m in sorted(monthly_collection)
+    ]
 
     return {
-        "totalCollected": total_collected, "totalPending": total_pending,
-        "totalFee": total_fee, "batches": batch_summaries, "overdue": overdue[:20],
-        "collectionTrend": collection_trend
+        "totalCollected": overall.get("totalCollected", 0),
+        "totalPending":   overall.get("totalPending", 0),
+        "totalFee":       overall.get("totalFee", 0),
+        "batches":        batch_summaries,
+        "overdue":        overdue[:20],
+        "collectionTrend": collection_trend,
     }
 
 
@@ -1585,16 +2955,25 @@ async def student_profile(sid: str, user=Depends(auth)):
     total_paid = sum(f.get("totalPaid", 0) for f in fees)
     total_pending = sum(f.get("totalPending", 0) for f in fees)
     # Tests
+    # In student_profile, replace the marks loop with:
+
     marks_list = await db.marks.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(100)
+    test_ids   = [m["testId"] for m in marks_list]
+    tests_docs = await db.tests.find({"id": {"$in": test_ids}}, {"_id": 0}).to_list(100) if test_ids else []
+    tests_map  = {t["id"]: t for t in tests_docs}
+
     test_results = []
     for m in marks_list:
-        test = await db.tests.find_one({"id": m["testId"]}, {"_id": 0})
+        test = tests_map.get(m["testId"])
         if test:
+            max_m = test["maximumMarks"]
             test_results.append({
-                "testName": test["testName"], "subject": test.get("subject", ""),
-                "marksObtained": m["marksObtained"], "maximumMarks": test["maximumMarks"],
-                "percentage": round(m["marksObtained"] / test["maximumMarks"] * 100, 1) if test["maximumMarks"] else 0,
-                "testDate": test.get("testDate", "")
+                "testName":      test["testName"],
+                "subject":       test.get("subject", ""),
+                "marksObtained": m["marksObtained"],
+                "maximumMarks":  max_m,
+                "percentage":    round(m["marksObtained"] / max_m * 100, 1) if max_m else 0,
+                "testDate":      test.get("testDate", ""),
             })
     return {
         "student": student,
@@ -1851,11 +3230,22 @@ async def list_live_classes(user=Depends(auth)):
     classes = await db.live_classes.find(q, {"_id": 0}).sort("startTime", -1).to_list(100)
 
     # Enrich with batch and teacher names
+    # Replace the enrichment loop at the bottom of list_live_classes:
+
+    if not classes:
+        return []
+
+    bid_list = [c.get("batchId",  "") for c in classes]
+    tid_list = [c.get("teacherId","") for c in classes]
+
+    batches_map, teachers_map = await asyncio.gather(
+        _get_batches_map(iid, bid_list),
+        _get_teachers_map(iid, tid_list),
+    )
+
     for c in classes:
-        batch = await db.batches.find_one({"id": c.get("batchId", "")}, {"_id": 0})
-        c["batchName"] = batch["batchName"] if batch else ""
-        teacher = await db.teachers.find_one({"id": c.get("teacherId", "")}, {"_id": 0})
-        c["teacherName"] = teacher["name"] if teacher else ""
+        c["batchName"]   = batches_map.get(c.get("batchId",  ""), {}).get("batchName", "")
+        c["teacherName"] = teachers_map.get(c.get("teacherId",""), {}).get("name",      "")
 
     return classes
 
@@ -2261,7 +3651,10 @@ async def do_seed():
 
 @api.post("/seed")
 async def seed_endpoint():
+    if os.environ.get("ENV") == "production":
+        raise HTTPException(404)
     return await do_seed()
+
 
 
 app.include_router(api)
@@ -2278,7 +3671,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     logger.info("Starting Growcad API...")
-    await do_seed()
+    if os.environ.get("ENV") != "production":
+        await do_seed()
+
     asyncio.create_task(_reminder_background_loop())
     logger.info("Fee reminder background job started")
     asyncio.create_task(_process_recordings())
