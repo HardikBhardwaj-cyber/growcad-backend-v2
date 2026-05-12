@@ -134,7 +134,11 @@ async def create_indexes():
     await db.message_logs.create_index([("instituteId", 1), ("timestamp", -1)])
     await db.absent_alerts.create_index([("studentId", 1), ("date", 1), ("instituteId", 1)])
 
-    await db.institutes.create_index("slug", unique=True)
+    await db.institutes.create_index(
+        "slug",
+        unique=True,
+        partialFilterExpression={"slug": {"$type": "string"}},
+    )
     await db.subscriptions.create_index("razorpayPaymentId", unique=True, sparse=True)
     await db.subscriptions.create_index("razorpayOrderId", sparse=True)
     await db.webhook_events.create_index("razorpayEventId", unique=True)
@@ -383,6 +387,11 @@ class SubdomainLoginReq(BaseModel):
     mobile: str
     otp:    str
     slug:   Optional[str] = None            # institute slug from frontend subdomain detection
+
+class SubdomainEmailLoginReq(BaseModel):
+    email: str
+    otp: str
+    slug: Optional[str] = None
 
 class InstituteCreateReq(BaseModel):
     mobile:           str
@@ -660,9 +669,9 @@ async def verify_otp_endpoint(data: VerifyOtpReq):
 @api.post("/auth/admin-signup")
 async def admin_signup(data: AdminSignupReq):
     """
-    Pre-register admin user + trigger OTPs for both mobile and email.
+    Pre-register admin user + trigger an email OTP.
     User is created with isVerified=False; /auth/verify-otp must be called
-    for both channels before /institute/create is called.
+    for email before /institute/create is called.
 
     Re-signup is allowed if the existing account is still unverified
     (i.e. the user never finished onboarding), so they can request fresh OTPs.
@@ -707,23 +716,12 @@ async def admin_signup(data: AdminSignupReq):
         }
         await db.users.insert_one(pending)
 
-    # Fire both OTPs concurrently; log failures but don't crash signup
-    mobile_otp = _generate_otp()
-    email_otp  = _generate_otp()
-    await _store_otp(mobile, "mobile", mobile_otp)
-    await _store_otp(email,  "email",  email_otp)
+    await check_otp_rate(email)
+    email_otp = _generate_otp()
+    await _store_otp(email, "email", email_otp)
+    await send_email_otp(email, email_otp)
 
-    results = await asyncio.gather(
-        _send_mobile_otp(mobile, mobile_otp),
-        _send_email_otp(email,   email_otp),
-        return_exceptions=True,
-    )
-    for i, r in enumerate(results):
-        if isinstance(r, Exception) or r is False:
-            channel = "mobile" if i == 0 else "email"
-            logger.error(f"OTP send failed for {channel} during admin-signup: {r}")
-
-    return {"sent": True, "mobile": mobile, "email": email}
+    return {"sent": True, "channel": "email", "mobile": mobile, "email": email}
 
 
 
@@ -795,6 +793,41 @@ async def subdomain_login(data: SubdomainLoginReq, request: Request):
     }
 
 
+@api.post("/auth/subdomain-email-login")
+async def subdomain_email_login(data: SubdomainEmailLoginReq, request: Request):
+    slug = _resolve_slug(request, data.slug)
+
+    if not slug:
+        raise HTTPException(400, "Institute not identified")
+
+    institute = await db.institutes.find_one({"slug": slug}, {"_id": 0})
+    if not institute:
+        raise HTTPException(404, f"Institute '{slug}' not found.")
+
+    iid = institute["id"]
+    email = data.email.strip().lower()
+
+    ok = await _consume_otp(email, "email", data.otp.strip())
+    if not ok:
+        raise HTTPException(400, "Invalid or expired OTP.")
+
+    u = await db.users.find_one({"email": email, "instituteId": iid}, {"_id": 0})
+    if not u or u.get("role") not in ("teacher", "student"):
+        raise HTTPException(
+            404,
+            "No student or teacher account found for this email in this institute. "
+            "Please contact your admin.",
+        )
+
+    token = make_token(u["id"], u["role"], iid, slug)
+
+    return {
+        "token": token,
+        "user": _safe_user(u),
+        "institute": institute
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INSTITUTE ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -821,25 +854,18 @@ async def create_institute(data: InstituteCreateReq):
     Create institute after OTP verification and onboarding form.
     Links the pending admin user to this institute.
     """
-    mobile = data.mobile.replace("+91", "").replace(" ", "").strip()
     email  = data.email.strip().lower()
     slug   = data.institute_slug.lower().strip()
 
-    # 🔐 Ensure OTP verified before creating institute
-    mobile_verified = await db.otp_verifications.find_one({
-        "target": mobile,
-        "channel": "mobile",
-        "verified": True
-    })
-
+    # Email-only verification keeps production onboarding independent of SMS DLT.
     email_verified = await db.otp_verifications.find_one({
         "target": email,
         "channel": "email",
         "verified": True
     })
 
-    if not mobile_verified or not email_verified:
-        raise HTTPException(403, "Please verify OTP first")
+    if not email_verified:
+        raise HTTPException(403, "Please verify your email OTP first")
 
     # Double-check slug
     if await db.institutes.find_one({"slug": slug}):
@@ -1390,7 +1416,13 @@ async def register(data: UserRegister):
         raise HTTPException(400, "Email already exists")
     iid = uid()
     if data.instituteName:
-        await db.institutes.insert_one({"id": iid, "name": data.instituteName, "createdAt": now_iso()})
+        slug = re.sub(r"[^a-z0-9]+", "-", data.instituteName.lower()).strip("-")[:40]
+        await db.institutes.insert_one({
+            "id": iid,
+            "name": data.instituteName,
+            "slug": slug or f"inst-{iid[:8]}",
+            "createdAt": now_iso(),
+        })
     user = {
         "id": uid(), "name": data.name, "email": data.email,
         "passwordHash": hash_pw(data.password), "role": data.role,
@@ -3405,14 +3437,26 @@ async def retry_recording(class_id: str, user=Depends(admin_only)):
 async def do_seed():
     existing = await db.institutes.find_one({"name": "Aman Gupta Coaching Institute"})
     if existing:
+        if not existing.get("slug"):
+            await db.institutes.update_one(
+                {"id": existing["id"]},
+                {"$set": {
+                    "slug": "aman-gupta",
+                    "domain": "aman-gupta.growcad.in",
+                    "subscriptionStatus": existing.get("subscriptionStatus", "active"),
+                }},
+            )
         return {"message": "Data already seeded", "instituteId": existing["id"]}
 
     iid = "inst_demo_001"
 
     await db.institutes.insert_one({
         "id": iid, "name": "Aman Gupta Coaching Institute",
+        "slug": "aman-gupta",
+        "domain": "aman-gupta.growcad.in",
         "address": "123 Education Lane, New Delhi", "phone": "+91-9876543210",
-        "email": "info@amangupta.edu", "createdAt": now_iso()
+        "email": "info@amangupta.edu", "subscriptionStatus": "active",
+        "plan": "standard", "addons": [], "createdAt": now_iso()
     })
 
     await db.users.insert_one({
