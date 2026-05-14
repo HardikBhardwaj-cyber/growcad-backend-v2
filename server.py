@@ -10,6 +10,7 @@ import csv
 import io
 import random
 import asyncio
+import mimetypes
 from pathlib import Path
 from pydantic import BaseModel
 from typing import List, Optional
@@ -126,6 +127,12 @@ async def create_indexes():
     # ─── live_classes ───
     await db.live_classes.create_index([("instituteId", 1), ("startTime", -1)])
     await db.live_classes.create_index([("batchId", 1), ("instituteId", 1)])
+
+    # ─── study_materials ───
+    await db.study_materials.create_index([("instituteId", 1), ("createdAt", -1)])
+    await db.study_materials.create_index([("instituteId", 1), ("accessTarget", 1), ("batchId", 1)])
+    await db.study_materials.create_index([("instituteId", 1), ("materialType", 1)])
+    await db.study_materials.create_index([("instituteId", 1), ("fileFormat", 1)])
 
     # ─── otp_verifications ───
     await db.otp_verifications.create_index(
@@ -325,12 +332,19 @@ any_role = require_role("admin", "teacher", "student")
 
 async def get_teacher_batch_ids(user):
     """Get batch IDs assigned to a teacher"""
-    teacher = await db.teachers.find_one({"id": user.get("teacherId", ""), "instituteId": user["instituteId"]}, {"_id": 0})
+    teacher_id = user.get("teacherId", "")
+    teacher = await db.teachers.find_one({"id": teacher_id, "instituteId": user["instituteId"]}, {"_id": 0})
+    batch_ids = set()
     if teacher:
-        return teacher.get("assignedBatches", [])
-    # Fallback: find batches where this teacher is assigned
-    batches = await db.batches.find({"teacherId": user.get("teacherId", ""), "instituteId": user["instituteId"]}, {"_id": 0}).to_list(100)
-    return [b["id"] for b in batches]
+        batch_ids.update(teacher.get("assignedBatches", []))
+
+    # Fallback/union: include legacy single-teacher and new multi-teacher batches.
+    batches = await db.batches.find({
+        "instituteId": user["instituteId"],
+        "$or": [{"teacherId": teacher_id}, {"teacherIds": teacher_id}],
+    }, {"_id": 0}).to_list(100)
+    batch_ids.update(b["id"] for b in batches)
+    return list(batch_ids)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BULK FETCH HELPERS  — use these instead of per-row find_one calls
@@ -361,6 +375,539 @@ async def _get_teachers_map(institute_id: str, teacher_ids: list = None) -> dict
         q["id"] = {"$in": list(set(teacher_ids))}
     docs = await db.teachers.find(q, {"_id": 0}).to_list(500)
     return {d["id"]: d for d in docs}
+
+
+# ---------------------------------------------------------------------------
+# STUDY MATERIALS / CLOUD STORAGE
+# ---------------------------------------------------------------------------
+
+ALLOWED_MATERIAL_FORMATS = {
+    "PDF", "DOCX", "PPTX", "XLSX", "MP4", "MP3",
+    "PNG", "JPG", "JPEG", "HTML", "JSON", "CSV",
+}
+
+MATERIAL_TYPE_PURPOSES = {
+    "Notes": "Concept learning",
+    "PPT": "Visual teaching",
+    "PDF": "Printable material",
+    "DPP": "Daily practice",
+    "Worksheet": "Homework",
+    "Assignment": "Evaluation",
+    "Quiz": "Quick testing",
+    "MCQ Bank": "Practice",
+    "PYQ": "Previous year questions",
+    "Mock Test": "Full exam",
+    "Formula Sheet": "Revision",
+    "Flashcards": "Memory learning",
+    "Mind Maps": "Quick understanding",
+    "Video Lectures": "Teaching",
+    "Audio Notes": "Listening learning",
+    "Lab Manual": "Practical work",
+    "Sample Papers": "Exam preparation",
+    "Answer Keys": "Self checking",
+}
+
+STUDY_ACCESS_TARGETS = {"admin_only", "all_students", "batch"}
+
+
+class StudyMaterialUploadUrlReq(BaseModel):
+    fileName: str
+    fileSizeBytes: int
+    mimeType: str = ""
+    materialType: str
+    accessTarget: str = "all_students"
+    batchId: str = ""
+
+
+class StudyMaterialCreateReq(BaseModel):
+    materialId: Optional[str] = None
+    title: str
+    description: str = ""
+    materialType: str
+    fileFormat: str = ""
+    mimeType: str = ""
+    fileName: str
+    fileSizeBytes: int
+    r2Key: str
+    accessTarget: str = "all_students"
+    batchId: str = ""
+    subject: str = ""
+    chapter: str = ""
+    topic: str = ""
+    tags: List[str] = []
+
+
+class StudyMaterialUpdateReq(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    materialType: Optional[str] = None
+    accessTarget: Optional[str] = None
+    batchId: Optional[str] = None
+    subject: Optional[str] = None
+    chapter: Optional[str] = None
+    topic: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
+class BuyStorageReq(BaseModel):
+    additionalGb: float
+
+
+def _material_file_format(file_name: str, mime_type: str = "") -> str:
+    suffix = Path(file_name or "").suffix.replace(".", "").upper()
+    if suffix:
+        return suffix
+    guessed = mimetypes.guess_extension(mime_type or "")
+    return (guessed or "").replace(".", "").upper()
+
+
+def _safe_material_file_name(file_name: str) -> str:
+    name = Path(file_name or "material").name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return safe or f"material-{uid()[:8]}"
+
+
+def _gb_to_bytes(gb: float) -> int:
+    return int(float(gb or 0) * 1024 * 1024 * 1024)
+
+
+def _validate_material_type(material_type: str) -> str:
+    mt = (material_type or "").strip()
+    if mt not in MATERIAL_TYPE_PURPOSES:
+        raise HTTPException(400, "Invalid material type.")
+    return mt
+
+
+def _validate_access_target(access_target: str) -> str:
+    target = (access_target or "all_students").strip()
+    if target not in STUDY_ACCESS_TARGETS:
+        raise HTTPException(400, "Invalid access target.")
+    return target
+
+
+def _validate_file(file_name: str, mime_type: str, file_size: int) -> str:
+    fmt = _material_file_format(file_name, mime_type)
+    if fmt not in ALLOWED_MATERIAL_FORMATS:
+        raise HTTPException(400, f"Unsupported file type '{fmt or 'unknown'}'.")
+    if int(file_size or 0) <= 0:
+        raise HTTPException(400, "File size must be greater than zero.")
+    return fmt
+
+
+def _r2_client_and_bucket():
+    account_id = os.environ.get("CLOUDFLARE_R2_ACCOUNT_ID", "")
+    access_key = os.environ.get("CLOUDFLARE_R2_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "")
+    bucket = os.environ.get("CLOUDFLARE_R2_BUCKET", "")
+
+    if not all([account_id, access_key, secret_key, bucket]):
+        return None, bucket
+
+    try:
+        import boto3
+        from botocore.client import Config
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",
+            config=Config(signature_version="s3v4"),
+        )
+        return client, bucket
+    except Exception as e:
+        logger.error(f"Cloudflare R2 client init failed: {e}")
+        return None, bucket
+
+
+async def _study_material_used_bytes(institute_id: str) -> int:
+    agg = await db.study_materials.aggregate([
+        {"$match": {"instituteId": institute_id}},
+        {"$group": {"_id": None, "used": {"$sum": "$fileSizeBytes"}}},
+    ]).to_list(1)
+    return int(agg[0]["used"]) if agg else 0
+
+
+async def _sync_institute_storage(institute_id: str) -> int:
+    used = await _study_material_used_bytes(institute_id)
+    await db.institutes.update_one(
+        {"id": institute_id},
+        {"$set": {"storageUsedBytes": used, "storageUpdatedAt": now_iso()}},
+    )
+    return used
+
+
+async def _study_material_storage_info(institute_id: str) -> dict:
+    active_students = await db.students.count_documents({"instituteId": institute_id})
+    institute = await db.institutes.find_one({"id": institute_id}, {"_id": 0}) or {}
+    plan_doc = await db.institute_plans.find_one({"instituteId": institute_id}, {"_id": 0}) or {}
+    plan = (plan_doc.get("plan") or institute.get("plan") or "standard").lower()
+
+    if active_students <= 150:
+        base_quota_gb = 30
+    elif active_students <= 250:
+        base_quota_gb = 50
+    elif active_students <= 500:
+        base_quota_gb = 100
+    elif active_students <= 750:
+        base_quota_gb = 150
+    else:
+        base_quota_gb = 200
+
+    additional_gb = float(institute.get("additionalStorageGb", 0) or 0)
+    base_bonus_bytes = active_students * 200 * 1024 * 1024 if plan == "base" else 0
+    used_bytes = await _study_material_used_bytes(institute_id)
+    quota_bytes = _gb_to_bytes(base_quota_gb + additional_gb) + base_bonus_bytes
+    remaining_bytes = max(quota_bytes - used_bytes, 0)
+    usage_percent = round((used_bytes / quota_bytes) * 100, 1) if quota_bytes else 0
+
+    await db.institutes.update_one(
+        {"id": institute_id},
+        {"$set": {
+            "storageUsedBytes": used_bytes,
+            "activeStudentCount": active_students,
+            "additionalStorageGb": additional_gb,
+        }},
+    )
+
+    return {
+        "usedBytes": used_bytes,
+        "quotaBytes": quota_bytes,
+        "remainingBytes": remaining_bytes,
+        "baseQuotaGb": base_quota_gb,
+        "additionalStorageGb": additional_gb,
+        "basePlanStudentBonusGb": round(base_bonus_bytes / (1024 * 1024 * 1024), 2),
+        "activeStudentCount": active_students,
+        "usagePercent": usage_percent,
+        "plan": plan,
+    }
+
+
+async def _ensure_storage_room(institute_id: str, incoming_bytes: int) -> None:
+    storage = await _study_material_storage_info(institute_id)
+    if storage["usedBytes"] + int(incoming_bytes or 0) > storage["quotaBytes"]:
+        raise HTTPException(
+            413,
+            "Storage quota exceeded. Buy additional storage before uploading this file.",
+        )
+
+
+async def _require_batch_for_material(institute_id: str, access_target: str, batch_id: str) -> dict:
+    if access_target != "batch":
+        return {}
+    if not batch_id:
+        raise HTTPException(400, "Batch is required when sharing with a particular batch.")
+    batch = await db.batches.find_one({"id": batch_id, "instituteId": institute_id}, {"_id": 0})
+    if not batch:
+        raise HTTPException(404, "Batch not found.")
+    return batch
+
+
+async def _material_allowed_for_user(user: dict, material: dict) -> bool:
+    if not material or material.get("instituteId") != user.get("instituteId"):
+        return False
+    role = user.get("role")
+    target = material.get("accessTarget", "all_students")
+    if role == "admin":
+        return True
+    if target == "admin_only":
+        return False
+    if target == "all_students":
+        return True
+    if target != "batch":
+        return False
+
+    batch_id = material.get("batchId", "")
+    if role == "student":
+        student = await db.students.find_one(
+            {"id": user.get("studentId", ""), "instituteId": user["instituteId"]},
+            {"_id": 0, "batchId": 1},
+        )
+        return bool(student and student.get("batchId") == batch_id)
+    if role == "teacher":
+        batch_ids = await get_teacher_batch_ids(user)
+        return batch_id in batch_ids
+    return False
+
+
+def _presigned_upload_url(r2_key: str, mime_type: str) -> str:
+    client, bucket = _r2_client_and_bucket()
+    if not client or not bucket:
+        raise HTTPException(503, "Cloudflare R2 storage is not configured.")
+    params = {"Bucket": bucket, "Key": r2_key}
+    if mime_type:
+        params["ContentType"] = mime_type
+    return client.generate_presigned_url(
+        "put_object",
+        Params=params,
+        ExpiresIn=900,
+    )
+
+
+def _presigned_download_url(r2_key: str, file_name: str = "") -> str:
+    client, bucket = _r2_client_and_bucket()
+    public_base = os.environ.get("CLOUDFLARE_R2_PUBLIC_BASE_URL", "").rstrip("/")
+    if client and bucket:
+        params = {"Bucket": bucket, "Key": r2_key}
+        if file_name:
+            params["ResponseContentDisposition"] = f'attachment; filename="{_safe_material_file_name(file_name)}"'
+        return client.generate_presigned_url("get_object", Params=params, ExpiresIn=900)
+    if public_base:
+        return f"{public_base}/{r2_key}"
+    raise HTTPException(503, "Cloudflare R2 storage is not configured.")
+
+
+def _delete_r2_object(r2_key: str) -> None:
+    client, bucket = _r2_client_and_bucket()
+    if not client or not bucket:
+        logger.warning("Skipping R2 delete because storage is not configured.")
+        return
+    try:
+        client.delete_object(Bucket=bucket, Key=r2_key)
+    except Exception as e:
+        logger.error(f"Failed to delete R2 object {r2_key}: {e}")
+
+
+@api.get("/study-materials")
+async def list_study_materials(
+    user=Depends(auth),
+    search: str = "",
+    materialType: str = "",
+    fileFormat: str = "",
+    accessTarget: str = "",
+    batchId: str = "",
+    subject: str = "",
+    chapter: str = "",
+    topic: str = "",
+    sort: str = "newest",
+):
+    iid = user["instituteId"]
+    q: dict = {"instituteId": iid}
+    permission_or = []
+
+    if user["role"] == "student":
+        student = await db.students.find_one(
+            {"id": user.get("studentId", ""), "instituteId": iid},
+            {"_id": 0, "batchId": 1},
+        )
+        permission_or = [{"accessTarget": "all_students"}]
+        if student and student.get("batchId"):
+            permission_or.append({"accessTarget": "batch", "batchId": student["batchId"]})
+    elif user["role"] == "teacher":
+        batch_ids = await get_teacher_batch_ids(user)
+        permission_or = [{"accessTarget": "all_students"}]
+        if batch_ids:
+            permission_or.append({"accessTarget": "batch", "batchId": {"$in": batch_ids}})
+    elif user["role"] != "admin":
+        permission_or = [{"accessTarget": "all_students"}]
+
+    and_clauses = []
+    if permission_or:
+        and_clauses.append({"$or": permission_or})
+
+    if search:
+        rx = {"$regex": search.strip(), "$options": "i"}
+        and_clauses.append({"$or": [
+            {"title": rx},
+            {"description": rx},
+            {"subject": rx},
+            {"chapter": rx},
+            {"topic": rx},
+            {"tags": rx},
+        ]})
+
+    if and_clauses:
+        q["$and"] = and_clauses
+    if materialType:
+        q["materialType"] = materialType
+    if fileFormat:
+        q["fileFormat"] = fileFormat.upper()
+    if accessTarget:
+        q["accessTarget"] = accessTarget
+    if batchId:
+        q["batchId"] = batchId
+    if subject:
+        q["subject"] = {"$regex": subject, "$options": "i"}
+    if chapter:
+        q["chapter"] = {"$regex": chapter, "$options": "i"}
+    if topic:
+        q["topic"] = {"$regex": topic, "$options": "i"}
+
+    sort_map = {
+        "oldest": [("createdAt", 1)],
+        "size": [("fileSizeBytes", -1)],
+        "name": [("title", 1)],
+        "newest": [("createdAt", -1)],
+    }
+    return await db.study_materials.find(q, {"_id": 0}).sort(
+        sort_map.get(sort, sort_map["newest"])
+    ).to_list(1000)
+
+
+@api.post("/study-materials/upload-url")
+async def create_study_material_upload_url(data: StudyMaterialUploadUrlReq, user=Depends(admin_only)):
+    iid = user["instituteId"]
+    material_type = _validate_material_type(data.materialType)
+    access_target = _validate_access_target(data.accessTarget)
+    file_format = _validate_file(data.fileName, data.mimeType, data.fileSizeBytes)
+    await _require_batch_for_material(iid, access_target, data.batchId)
+    await _ensure_storage_room(iid, data.fileSizeBytes)
+
+    material_id = uid()
+    safe_file = _safe_material_file_name(data.fileName)
+    r2_key = f"institutes/{iid}/materials/{material_id}/{safe_file}"
+    upload_url = _presigned_upload_url(r2_key, data.mimeType or mimetypes.guess_type(data.fileName)[0] or "")
+
+    return {
+        "uploadUrl": upload_url,
+        "r2Key": r2_key,
+        "materialId": material_id,
+        "fileFormat": file_format,
+        "materialType": material_type,
+        "expiresIn": 900,
+    }
+
+
+@api.post("/study-materials")
+async def create_study_material(data: StudyMaterialCreateReq, user=Depends(admin_only)):
+    iid = user["instituteId"]
+    material_type = _validate_material_type(data.materialType)
+    access_target = _validate_access_target(data.accessTarget)
+    file_format = (data.fileFormat or _validate_file(data.fileName, data.mimeType, data.fileSizeBytes)).upper()
+    if file_format not in ALLOWED_MATERIAL_FORMATS:
+        raise HTTPException(400, "Unsupported file format.")
+    await _ensure_storage_room(iid, data.fileSizeBytes)
+
+    prefix = f"institutes/{iid}/materials/"
+    if not data.r2Key.startswith(prefix):
+        raise HTTPException(400, "Invalid storage key for this institute.")
+
+    batch = await _require_batch_for_material(iid, access_target, data.batchId)
+    material_id = data.materialId or uid()
+    material = {
+        "id": material_id,
+        "instituteId": iid,
+        "title": data.title.strip(),
+        "description": data.description.strip(),
+        "materialType": material_type,
+        "purpose": MATERIAL_TYPE_PURPOSES[material_type],
+        "fileFormat": file_format,
+        "mimeType": data.mimeType,
+        "fileName": data.fileName,
+        "fileSizeBytes": int(data.fileSizeBytes),
+        "r2Key": data.r2Key,
+        "accessTarget": access_target,
+        "batchId": data.batchId if access_target == "batch" else "",
+        "batchName": batch.get("batchName", "") if batch else "",
+        "subject": data.subject.strip(),
+        "chapter": data.chapter.strip(),
+        "topic": data.topic.strip(),
+        "tags": [str(t).strip() for t in (data.tags or []) if str(t).strip()],
+        "uploadedBy": user.get("name", "Admin"),
+        "uploadedById": user.get("id", ""),
+        "downloadCount": 0,
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    if not material["title"]:
+        raise HTTPException(400, "Title is required.")
+
+    await db.study_materials.insert_one(material)
+    await _sync_institute_storage(iid)
+    material.pop("_id", None)
+    return material
+
+
+@api.put("/study-materials/{mid}")
+async def update_study_material(mid: str, data: StudyMaterialUpdateReq, user=Depends(admin_only)):
+    iid = user["instituteId"]
+    existing = await db.study_materials.find_one({"id": mid, "instituteId": iid})
+    if not existing:
+        raise HTTPException(404, "Study material not found.")
+
+    raw = data.model_dump(exclude_unset=True)
+    update: dict = {}
+    for key in ("title", "description", "subject", "chapter", "topic"):
+        if key in raw:
+            update[key] = (raw.get(key) or "").strip()
+    if "tags" in raw:
+        update["tags"] = [str(t).strip() for t in (raw.get("tags") or []) if str(t).strip()]
+    if "materialType" in raw:
+        mt = _validate_material_type(raw["materialType"])
+        update["materialType"] = mt
+        update["purpose"] = MATERIAL_TYPE_PURPOSES[mt]
+    if "accessTarget" in raw or "batchId" in raw:
+        access_target = _validate_access_target(raw.get("accessTarget", existing.get("accessTarget", "all_students")))
+        batch_id = raw.get("batchId", existing.get("batchId", ""))
+        batch = await _require_batch_for_material(iid, access_target, batch_id)
+        update["accessTarget"] = access_target
+        update["batchId"] = batch_id if access_target == "batch" else ""
+        update["batchName"] = batch.get("batchName", "") if batch else ""
+
+    if update:
+        update["updatedAt"] = now_iso()
+        await db.study_materials.update_one({"_id": existing["_id"]}, {"$set": update})
+
+    return await db.study_materials.find_one({"id": mid, "instituteId": iid}, {"_id": 0})
+
+
+@api.delete("/study-materials/{mid}")
+async def delete_study_material(mid: str, user=Depends(admin_only)):
+    iid = user["instituteId"]
+    material = await db.study_materials.find_one({"id": mid, "instituteId": iid})
+    if not material:
+        raise HTTPException(404, "Study material not found.")
+    _delete_r2_object(material.get("r2Key", ""))
+    await db.study_materials.delete_one({"_id": material["_id"]})
+    await _sync_institute_storage(iid)
+    return {"ok": True}
+
+
+@api.get("/study-materials/{mid}/download-url")
+async def get_study_material_download_url(mid: str, user=Depends(auth)):
+    material = await db.study_materials.find_one(
+        {"id": mid, "instituteId": user["instituteId"]},
+        {"_id": 0},
+    )
+    if not await _material_allowed_for_user(user, material):
+        raise HTTPException(403, "Access denied.")
+    download_url = _presigned_download_url(material["r2Key"], material.get("fileName", ""))
+    await db.study_materials.update_one(
+        {"id": mid, "instituteId": user["instituteId"]},
+        {"$inc": {"downloadCount": 1}, "$set": {"lastDownloadedAt": now_iso()}},
+    )
+    return {"downloadUrl": download_url}
+
+
+@api.get("/study-materials/storage")
+async def get_study_material_storage(user=Depends(auth)):
+    if user.get("role") not in ("admin", "teacher"):
+        raise HTTPException(403, "Access denied.")
+    return await _study_material_storage_info(user["instituteId"])
+
+
+@api.post("/study-materials/buy-storage")
+async def buy_study_material_storage(data: BuyStorageReq, user=Depends(admin_only)):
+    additional_gb = float(data.additionalGb or 0)
+    if additional_gb <= 0:
+        raise HTTPException(400, "Additional storage must be greater than zero.")
+    if additional_gb > 5000:
+        raise HTTPException(400, "Please contact support for storage above 5000 GB.")
+
+    monthly_amount = round(additional_gb * 5, 2)
+    await db.institutes.update_one(
+        {"id": user["instituteId"]},
+        {
+            "$inc": {"additionalStorageGb": additional_gb},
+            "$set": {
+                "additionalStorageMonthlyAmount": monthly_amount,
+                "storageUpdatedAt": now_iso(),
+            },
+        },
+    )
+    storage = await _study_material_storage_info(user["instituteId"])
+    return {"ok": True, "monthlyAmount": monthly_amount, "storage": storage}
 
 """
 backend/auth_routes.py
@@ -1497,7 +2044,9 @@ class BatchCreate(BaseModel):
     batchName: str
     courseName: str = ""
     subject: str = ""
+    subjects: List[str] = []
     teacherId: str = ""
+    teacherIds: List[str] = []
     classDuration: str = ""
     scheduleDays: List[str] = []
     startDate: str = ""
@@ -1832,7 +2381,16 @@ async def _student_dashboard(user):
         db.batches.find_one({"id": batch_id}, {"_id": 0}) if batch_id else _none(),
         db.tests.find({"id": {"$in": test_ids}}, {"_id": 0}).to_list(100) if test_ids else _none(),
         db.announcements.find(
-            {"instituteId": iid, "$or": [{"targetBatchId": ""}, {"targetBatchId": batch_id}]},
+            {
+                "instituteId": iid,
+                "$and": [
+                    {"$or": [
+                        {"targetAudience": {"$exists": False}},
+                        {"targetAudience": "students"},
+                    ]},
+                    {"$or": [{"targetBatchId": ""}, {"targetBatchId": batch_id}]},
+                ],
+            },
             {"_id": 0},
         ).sort("createdAt", -1).to_list(5),
     )
@@ -2158,7 +2716,12 @@ async def list_batches(user=Depends(auth)):
         return []
 
     bid_list = [b["id"] for b in batches]
-    tid_list = [b.get("teacherId", "") for b in batches if b.get("teacherId")]
+    tid_list = list({
+        tid
+        for b in batches
+        for tid in ([b.get("teacherId", "")] + (b.get("teacherIds") if isinstance(b.get("teacherIds"), list) else []))
+        if tid
+    })
 
     # Parallel: student counts per batch + teacher lookup
     count_agg, teachers_map = await asyncio.gather(
@@ -2173,7 +2736,15 @@ async def list_batches(user=Depends(auth)):
 
     for b in batches:
         b["studentCount"] = count_map.get(b["id"], 0)
-        b["teacherName"]  = teachers_map.get(b.get("teacherId", ""), {}).get("name", "")
+        multi_teacher_ids = b.get("teacherIds") if isinstance(b.get("teacherIds"), list) else []
+        teacher_ids = multi_teacher_ids or ([b.get("teacherId", "")] if b.get("teacherId") else [])
+        teacher_names = [
+            teachers_map.get(tid, {}).get("name", "")
+            for tid in teacher_ids
+            if teachers_map.get(tid, {}).get("name", "")
+        ]
+        b["teacherNames"] = teacher_names
+        b["teacherName"] = teacher_names[0] if teacher_names else ""
 
     return batches
 
@@ -2844,8 +3415,32 @@ async def performance_report(user=Depends(auth), batchId: str = "", subject: str
 # ─── NOTIFICATIONS ───
 
 @api.get("/notifications")
-async def list_notifications(user=Depends(auth)):
-    return await db.notifications.find({"instituteId": user["instituteId"]}, {"_id": 0}).sort("createdAt", -1).to_list(50)
+async def list_notifications(user=Depends(auth), range: str = "overall", limit: str = "all"):
+    q = {"instituteId": user["instituteId"]}
+    range_key = (range or "overall").lower()
+
+    now = datetime.now(timezone.utc)
+    start = None
+    if range_key == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif range_key == "week":
+        start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start_of_today - timedelta(days=(start_of_today.weekday() + 1) % 7)
+    elif range_key == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if start:
+        q["createdAt"] = {"$gte": start.isoformat()}
+
+    cursor = db.notifications.find(q, {"_id": 0}).sort("createdAt", -1)
+    if str(limit).lower() == "all":
+        return await cursor.to_list(100000)
+
+    try:
+        limit_count = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit_count = 100000
+    return await cursor.to_list(limit_count)
 
 
 @api.put("/notifications/{nid}/read")
@@ -2857,6 +3452,18 @@ async def mark_notification_read(nid: str, user=Depends(auth)):
 @api.put("/notifications/read-all")
 async def mark_all_read(user=Depends(auth)):
     await db.notifications.update_many({"instituteId": user["instituteId"]}, {"$set": {"read": True}})
+    return {"ok": True}
+
+
+@api.delete("/notifications/{nid}")
+async def delete_notification(nid: str, user=Depends(auth)):
+    await db.notifications.delete_one({"id": nid, "instituteId": user["instituteId"]})
+    return {"ok": True}
+
+
+@api.delete("/notifications")
+async def delete_all_notifications(user=Depends(auth)):
+    await db.notifications.delete_many({"instituteId": user["instituteId"]})
     return {"ok": True}
 
 
@@ -3230,7 +3837,15 @@ async def list_announcements(user=Depends(auth), limit: int = 20):
     if user["role"] == "student":
         student = await db.students.find_one({"id": user.get("studentId", "")}, {"_id": 0})
         bid = student.get("batchId", "") if student else ""
-        q["$or"] = [{"targetBatchId": ""}, {"targetBatchId": bid}]
+        q["$and"] = [
+            {"$or": [
+                {"targetAudience": {"$exists": False}},
+                {"targetAudience": "students"},
+            ]},
+            {"$or": [{"targetBatchId": ""}, {"targetBatchId": bid}]},
+        ]
+    elif user["role"] == "teacher":
+        q["targetAudience"] = "teachers"
     return await db.announcements.find(q, {"_id": 0}).sort("createdAt", -1).to_list(limit)
 
 
@@ -3238,7 +3853,10 @@ async def list_announcements(user=Depends(auth), limit: int = 20):
 async def create_announcement(data: dict, user=Depends(admin_only)):
     title = data.get("title", "").strip()
     message = data.get("message", "").strip()
-    target_batch = data.get("targetBatchId", "")
+    target_audience = str(data.get("targetAudience") or "students").strip().lower()
+    if target_audience not in ("students", "teachers"):
+        raise HTTPException(400, "targetAudience must be 'students' or 'teachers'")
+    target_batch = "" if target_audience == "teachers" else (data.get("targetBatchId") or "")
     if not title or not message:
         raise HTTPException(400, "Title and message required")
     batch_name = ""
@@ -3247,6 +3865,7 @@ async def create_announcement(data: dict, user=Depends(admin_only)):
         batch_name = batch["batchName"] if batch else ""
     ann = {
         "id": uid(), "title": title, "message": message,
+        "targetAudience": target_audience,
         "targetBatchId": target_batch, "targetBatchName": batch_name,
         "createdBy": user.get("name", "Admin"),
         "createdAt": now_iso(), "instituteId": user["instituteId"]
@@ -3364,6 +3983,8 @@ DEFAULT_FEATURE_FLAGS = {
     "fee_enabled": True,
     "reminders_enabled": True,
     "communication_enabled": True,
+    "multi_teacher_batches_enabled": False,
+    "multi_subject_batches_enabled": False,
 }
 
 
@@ -3372,12 +3993,19 @@ async def get_feature_flags(user=Depends(auth)):
     flags = await db.feature_flags.find_one({"instituteId": user["instituteId"]}, {"_id": 0})
     if not flags:
         return {**DEFAULT_FEATURE_FLAGS, "instituteId": user["instituteId"]}
-    return flags
+    return {**DEFAULT_FEATURE_FLAGS, **flags}
 
 
 @api.put("/settings/features")
 async def update_feature_flags(data: dict, user=Depends(admin_only)):
-    allowed = {"attendance_enabled", "fee_enabled", "reminders_enabled", "communication_enabled"}
+    allowed = {
+        "attendance_enabled",
+        "fee_enabled",
+        "reminders_enabled",
+        "communication_enabled",
+        "multi_teacher_batches_enabled",
+        "multi_subject_batches_enabled",
+    }
     update = {k: bool(v) for k, v in data.items() if k in allowed}
     update["instituteId"] = user["instituteId"]
     update["updatedAt"] = now_iso()
