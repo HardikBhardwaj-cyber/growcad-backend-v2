@@ -112,6 +112,8 @@ async def create_indexes():
     await db.student_fees.create_index([("instituteId", 1), ("batchId", 1)])
     await db.student_fees.create_index([("instituteId", 1), ("studentId", 1)])
     await db.student_fees.create_index("studentId")
+    await db.payment_receipts.create_index([("instituteId", 1), ("createdAt", -1)])
+    await db.payment_receipts.create_index([("studentFeeId", 1), ("createdAt", -1)])
 
     # ─── tests / marks ───
     await db.tests.create_index([("instituteId", 1), ("batchId", 1)])
@@ -407,7 +409,7 @@ MATERIAL_TYPE_PURPOSES = {
     "Answer Keys": "Self checking",
 }
 
-STUDY_ACCESS_TARGETS = {"admin_only", "all_students", "batch"}
+STUDY_ACCESS_TARGETS = {"admin_only", "all_batches", "all_students", "batch"}
 
 
 class StudyMaterialUploadUrlReq(BaseModel):
@@ -415,7 +417,7 @@ class StudyMaterialUploadUrlReq(BaseModel):
     fileSizeBytes: int
     mimeType: str = ""
     materialType: str
-    accessTarget: str = "all_students"
+    accessTarget: str = "all_batches"
     batchId: str = ""
 
 
@@ -429,7 +431,7 @@ class StudyMaterialCreateReq(BaseModel):
     fileName: str
     fileSizeBytes: int
     r2Key: str
-    accessTarget: str = "all_students"
+    accessTarget: str = "all_batches"
     batchId: str = ""
     subject: str = ""
     chapter: str = ""
@@ -479,10 +481,53 @@ def _validate_material_type(material_type: str) -> str:
 
 
 def _validate_access_target(access_target: str) -> str:
-    target = (access_target or "all_students").strip()
+    target = (access_target or "all_batches").strip()
+    if target == "all_students":
+        target = "all_batches"
     if target not in STUDY_ACCESS_TARGETS:
         raise HTTPException(400, "Invalid access target.")
     return target
+
+
+def _storage_capacity_from_value(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+    raw = str(value)
+    numbers = [int(n) for n in re.findall(r"\d+", raw)]
+    return max(numbers) if numbers else None
+
+
+def _storage_quota_for_capacity(capacity_value) -> tuple[int, int]:
+    capacity = _storage_capacity_from_value(capacity_value) or 150
+    if capacity <= 150:
+        return 150, 30
+    if capacity <= 250:
+        return 250, 50
+    if capacity <= 500:
+        return 500, 100
+    if capacity <= 750:
+        return 750, 150
+    return 1000, 200
+
+
+def _selected_student_capacity(institute: dict, active_students: int) -> int:
+    capacity_keys = (
+        "planStudentCapacity",
+        "planCapacity",
+        "totalStrength",
+        "totalStrengthRange",
+        "studentCapacity",
+        "studentLimit",
+        "capacity",
+        "maxStudents",
+    )
+    for key in capacity_keys:
+        parsed = _storage_capacity_from_value(institute.get(key))
+        if parsed:
+            return parsed
+    return active_students or 150
 
 
 def _validate_file(file_name: str, mime_type: str, file_size: int) -> str:
@@ -543,22 +588,13 @@ async def _study_material_storage_info(institute_id: str) -> dict:
     institute = await db.institutes.find_one({"id": institute_id}, {"_id": 0}) or {}
     plan_doc = await db.institute_plans.find_one({"instituteId": institute_id}, {"_id": 0}) or {}
     plan = (plan_doc.get("plan") or institute.get("plan") or "standard").lower()
-
-    if active_students <= 150:
-        base_quota_gb = 30
-    elif active_students <= 250:
-        base_quota_gb = 50
-    elif active_students <= 500:
-        base_quota_gb = 100
-    elif active_students <= 750:
-        base_quota_gb = 150
-    else:
-        base_quota_gb = 200
+    student_capacity, base_quota_gb = _storage_quota_for_capacity(
+        _selected_student_capacity(institute, active_students)
+    )
 
     additional_gb = float(institute.get("additionalStorageGb", 0) or 0)
-    base_bonus_bytes = active_students * 200 * 1024 * 1024 if plan == "base" else 0
     used_bytes = await _study_material_used_bytes(institute_id)
-    quota_bytes = _gb_to_bytes(base_quota_gb + additional_gb) + base_bonus_bytes
+    quota_bytes = _gb_to_bytes(base_quota_gb + additional_gb)
     remaining_bytes = max(quota_bytes - used_bytes, 0)
     usage_percent = round((used_bytes / quota_bytes) * 100, 1) if quota_bytes else 0
 
@@ -567,6 +603,7 @@ async def _study_material_storage_info(institute_id: str) -> dict:
         {"$set": {
             "storageUsedBytes": used_bytes,
             "activeStudentCount": active_students,
+            "studentCapacity": student_capacity,
             "additionalStorageGb": additional_gb,
         }},
     )
@@ -577,8 +614,9 @@ async def _study_material_storage_info(institute_id: str) -> dict:
         "remainingBytes": remaining_bytes,
         "baseQuotaGb": base_quota_gb,
         "additionalStorageGb": additional_gb,
-        "basePlanStudentBonusGb": round(base_bonus_bytes / (1024 * 1024 * 1024), 2),
+        "basePlanStudentBonusGb": 0,
         "activeStudentCount": active_students,
+        "studentCapacity": student_capacity,
         "usagePercent": usage_percent,
         "plan": plan,
     }
@@ -597,7 +635,7 @@ async def _require_batch_for_material(institute_id: str, access_target: str, bat
     if access_target != "batch":
         return {}
     if not batch_id:
-        raise HTTPException(400, "Batch is required when sharing with a particular batch.")
+        raise HTTPException(400, "Batch is required when sharing with a selected batch.")
     batch = await db.batches.find_one({"id": batch_id, "instituteId": institute_id}, {"_id": 0})
     if not batch:
         raise HTTPException(404, "Batch not found.")
@@ -608,12 +646,12 @@ async def _material_allowed_for_user(user: dict, material: dict) -> bool:
     if not material or material.get("instituteId") != user.get("instituteId"):
         return False
     role = user.get("role")
-    target = material.get("accessTarget", "all_students")
+    target = _validate_access_target(material.get("accessTarget", "all_batches"))
     if role == "admin":
         return True
     if target == "admin_only":
         return False
-    if target == "all_students":
+    if target == "all_batches":
         return True
     if target != "batch":
         return False
@@ -691,16 +729,16 @@ async def list_study_materials(
             {"id": user.get("studentId", ""), "instituteId": iid},
             {"_id": 0, "batchId": 1},
         )
-        permission_or = [{"accessTarget": "all_students"}]
+        permission_or = [{"accessTarget": {"$in": ["all_batches", "all_students"]}}]
         if student and student.get("batchId"):
             permission_or.append({"accessTarget": "batch", "batchId": student["batchId"]})
     elif user["role"] == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
-        permission_or = [{"accessTarget": "all_students"}]
+        permission_or = [{"accessTarget": {"$in": ["all_batches", "all_students"]}}]
         if batch_ids:
             permission_or.append({"accessTarget": "batch", "batchId": {"$in": batch_ids}})
     elif user["role"] != "admin":
-        permission_or = [{"accessTarget": "all_students"}]
+        permission_or = [{"accessTarget": {"$in": ["all_batches", "all_students"]}}]
 
     and_clauses = []
     if permission_or:
@@ -724,7 +762,12 @@ async def list_study_materials(
     if fileFormat:
         q["fileFormat"] = fileFormat.upper()
     if accessTarget:
-        q["accessTarget"] = accessTarget
+        normalized_target = _validate_access_target(accessTarget)
+        q["accessTarget"] = (
+            {"$in": ["all_batches", "all_students"]}
+            if normalized_target == "all_batches"
+            else normalized_target
+        )
     if batchId:
         q["batchId"] = batchId
     if subject:
@@ -838,7 +881,7 @@ async def update_study_material(mid: str, data: StudyMaterialUpdateReq, user=Dep
         update["materialType"] = mt
         update["purpose"] = MATERIAL_TYPE_PURPOSES[mt]
     if "accessTarget" in raw or "batchId" in raw:
-        access_target = _validate_access_target(raw.get("accessTarget", existing.get("accessTarget", "all_students")))
+        access_target = _validate_access_target(raw.get("accessTarget", existing.get("accessTarget", "all_batches")))
         batch_id = raw.get("batchId", existing.get("batchId", ""))
         batch = await _require_batch_for_material(iid, access_target, batch_id)
         update["accessTarget"] = access_target
@@ -2056,7 +2099,8 @@ class BatchCreate(BaseModel):
 class AttendanceMark(BaseModel):
     batchId: str
     date: str
-    records: List[dict]  # {studentId, status: present|absent|late}
+    records: List[dict]  # {studentId, status: present|absent|late|suspended}
+    classSuspended: bool = False
 
 
 class LiveClassCreate(BaseModel):
@@ -2086,6 +2130,8 @@ class FeePaymentReq(BaseModel):
     studentFeeId: str
     installmentIndex: int
     amount: float
+    method: str = "cash"
+    note: str = ""
 
 
 class TestCreate(BaseModel):
@@ -2263,7 +2309,7 @@ async def _admin_dashboard(user):
             {"_id": 0, "totalPaid": 1, "totalPending": 1, "installments": 1, "studentId": 1},
         ).to_list(2000),
         db.attendance.aggregate([
-            {"$match": {"instituteId": iid}},
+            {"$match": {"instituteId": iid, "status": {"$ne": "suspended"}}},
             {"$group": {
                 "_id":     None,
                 "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
@@ -2271,7 +2317,7 @@ async def _admin_dashboard(user):
             }},
         ]).to_list(1),
         db.attendance.aggregate([
-            {"$match": {"instituteId": iid, "date": today_str}},
+            {"$match": {"instituteId": iid, "date": today_str, "status": {"$ne": "suspended"}}},
             {"$group": {
                 "_id":     None,
                 "present": {"$sum": {"$cond": [{"$in": ["$status", ["present", "late"]]}, 1, 0]}},
@@ -2356,7 +2402,7 @@ async def _student_dashboard(user):
     student, att_agg, fees, marks, notifs = await asyncio.gather(
         db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0}),
         db.attendance.aggregate([
-            {"$match": {"studentId": sid, "instituteId": iid}},
+            {"$match": {"studentId": sid, "instituteId": iid, "status": {"$ne": "suspended"}}},
             {"$group": {
                 "_id":     None,
                 "present": {"$sum": {"$cond": [{"$eq": ["$status", "present"]}, 1, 0]}},
@@ -2780,10 +2826,18 @@ async def mark_attendance(
     user=Depends(teacher_or_admin)
 ):
     iid = user["instituteId"]
+    flags = await db.feature_flags.find_one({"instituteId": iid}, {"_id": 0}) or {}
+    late_enabled = bool({**DEFAULT_FEATURE_FLAGS, **flags}.get("late_attendance_enabled", False))
 
     operations = []
 
     for r in data.records:
+        status = "suspended" if data.classSuspended else r.get("status", "present")
+        if status == "late" and not late_enabled:
+            status = "absent"
+        if status not in ("present", "absent", "late", "suspended"):
+            raise HTTPException(400, "Invalid attendance status")
+
         operations.append(
             UpdateOne(
                 {
@@ -2793,7 +2847,11 @@ async def mark_attendance(
                     "instituteId": iid
                 },
                 {
-                    "$set": {"status": r["status"]},
+                    "$set": {
+                        "status": status,
+                        "classSuspended": data.classSuspended or status == "suspended",
+                        "updatedAt": now_iso(),
+                    },
                     "$setOnInsert": {"id": uid()}
                 },
                 upsert=True
@@ -2804,7 +2862,11 @@ async def mark_attendance(
         await db.attendance.bulk_write(operations)
 
     # 🚀 BACKGROUND TASK (UNCHANGED)
-    absent_ids = [r["studentId"] for r in data.records if r["status"] == "absent"]
+    absent_ids = [] if data.classSuspended else [
+        r["studentId"]
+        for r in data.records
+        if (r.get("status") == "absent" or (r.get("status") == "late" and not late_enabled))
+    ]
 
     if absent_ids:
         background_tasks.add_task(
@@ -2906,39 +2968,242 @@ async def get_attendance(user=Depends(auth), batchId: str = "", date: str = "", 
         q["date"] = date
     if studentId and user["role"] != "student":
         q["studentId"] = studentId
-    return await db.attendance.find(q, {"_id": 0}).to_list(1000)
+    if not (batchId and date):
+        q["status"] = {"$ne": "suspended"}
+    records = await db.attendance.find(q, {"_id": 0}).to_list(1000)
+    if batchId and date and user["role"] != "student":
+        suspended = any(
+            r.get("classSuspended") or r.get("status") == "suspended"
+            for r in records
+        )
+        return {"classSuspended": suspended, "records": records}
+    return records
 
 
 # ─── FEES ───
 
-async def _assign_student_fee(student_id, fee_structure, institute_id):
-    installments = []
-    total = fee_structure["totalCourseFee"]
-    n = fee_structure.get("numberOfInstallments", 1)
-    plan = fee_structure.get("paymentPlan", "one_time")
-    first_due = fee_structure.get("firstDueDate", now_iso()[:10])
+FEE_PLAN_MONTH_GAPS = {
+    "one_time": 0,
+    "monthly": 1,
+    "quarterly": 3,
+    "half_yearly": 6,
+    "annually": 12,
+    "custom": 1,
+}
+
+
+def _parse_fee_date(value: str):
+    if not value:
+        return None
     try:
-        base_date = datetime.strptime(first_due, "%Y-%m-%d")
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
     except Exception:
-        base_date = datetime.now(timezone.utc)
-    amt_per = round(total / n, 2)
-    months_map = {"one_time": 0, "monthly": 1, "quarterly": 3, "half_yearly": 6, "annually": 12, "custom": 1}
-    gap = months_map.get(plan, 1)
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+        except Exception:
+            return None
+
+
+def _month_key(value):
+    return (value.year, value.month) if value else None
+
+
+def _fee_installment_templates(fee_structure: dict, student: dict = None) -> list:
+    total = float(fee_structure.get("totalCourseFee", 0) or 0)
+    n = max(1, int(fee_structure.get("numberOfInstallments", 1) or 1))
+    plan = fee_structure.get("paymentPlan", "one_time")
+    first_due = _parse_fee_date(fee_structure.get("firstDueDate")) or datetime.now(timezone.utc).date()
+    admission = _parse_fee_date((student or {}).get("admissionDate", ""))
+    admission_month = _month_key(admission)
+    gap_months = FEE_PLAN_MONTH_GAPS.get(plan, 1)
+
+    base_amount = round(total / n, 2) if n else total
+    templates = []
     for i in range(n):
-        due = base_date + timedelta(days=gap * 30 * i)
-        installments.append({
-            "index": i, "amount": amt_per, "dueDate": due.strftime("%Y-%m-%d"),
-            "status": "pending", "paidAmount": 0, "paidDate": None
+        due = first_due + timedelta(days=gap_months * 30 * i)
+        if admission_month and _month_key(due) < admission_month:
+            continue
+
+        amount = base_amount
+        if i == n - 1:
+            amount = round(total - (base_amount * (n - 1)), 2)
+
+        templates.append({
+            "index": i,
+            "amount": max(0, amount),
+            "dueDate": due.strftime("%Y-%m-%d"),
+            "status": "pending",
+            "paidAmount": 0,
+            "paidDate": None,
+            "paidAt": None,
+            "payments": [],
         })
+    return templates
+
+
+async def _assign_student_fee(student_id, fee_structure, institute_id):
+    student = await db.students.find_one({"id": student_id, "instituteId": institute_id}, {"_id": 0})
+    installments = _fee_installment_templates(fee_structure, student)
+    total = round(sum(float(i.get("amount", 0) or 0) for i in installments), 2)
+    plan = fee_structure.get("paymentPlan", "one_time")
     sf = {
         "id": uid(), "studentId": student_id, "feeStructureId": fee_structure["id"],
         "batchId": fee_structure["batchId"], "totalFee": total, "paymentPlan": plan,
         "installments": installments, "totalPaid": 0, "totalPending": total,
+        "creditBalance": 0,
+        "admissionDate": (student or {}).get("admissionDate", ""),
         "instituteId": institute_id, "createdAt": now_iso()
     }
     await db.student_fees.insert_one(sf)
     sf.pop("_id", None)
     return sf
+
+
+def _normalize_existing_installments(installments: list) -> dict:
+    existing = {}
+    for pos, inst in enumerate(installments or []):
+        idx = inst.get("index", pos)
+        existing[idx] = inst
+    return existing
+
+
+async def _recalculate_student_fee_schedule(sf: dict, fee_structure: dict, student: dict):
+    templates = _fee_installment_templates(fee_structure, student)
+    old_map = _normalize_existing_installments(sf.get("installments", []))
+    existing_total_paid = float(sf.get("creditBalance", 0) or 0)
+    for old in sf.get("installments", []):
+        existing_total_paid += float(old.get("paidAmount", 0) or 0)
+
+    new_installments = []
+    for pos, inst in enumerate(templates):
+        old = old_map.get(inst.get("index"), {})
+        old_paid = float(old.get("paidAmount", 0) or 0)
+        amount = float(inst.get("amount", 0) or 0)
+        paid_applied = min(old_paid, amount)
+        payments = old.get("payments", [])
+
+        inst["paidAmount"] = round(paid_applied, 2)
+        inst["payments"] = payments if isinstance(payments, list) else []
+        inst["paidDate"] = old.get("paidDate")
+        inst["paidAt"] = old.get("paidAt")
+        if paid_applied >= amount and amount > 0:
+            inst["status"] = "paid"
+        elif paid_applied > 0:
+            inst["status"] = "partial"
+        else:
+            inst["status"] = "pending"
+        new_installments.append(inst)
+
+    total_fee = round(sum(float(i.get("amount", 0) or 0) for i in new_installments), 2)
+    total_paid = round(min(existing_total_paid, total_fee), 2)
+    credit_balance = round(max(0, existing_total_paid - total_fee), 2)
+    total_pending = round(max(0, total_fee - total_paid), 2)
+
+    await db.student_fees.update_one(
+        {"_id": sf["_id"]},
+        {"$set": {
+            "batchId": fee_structure["batchId"],
+            "paymentPlan": fee_structure.get("paymentPlan", "one_time"),
+            "installments": new_installments,
+            "totalFee": total_fee,
+            "totalPaid": total_paid,
+            "totalPending": total_pending,
+            "creditBalance": credit_balance,
+            "admissionDate": (student or {}).get("admissionDate", sf.get("admissionDate", "")),
+            "updatedAt": now_iso(),
+        }},
+    )
+
+
+async def _recalculate_batch_student_fees(fee_structure: dict, institute_id: str):
+    students = await db.students.find(
+        {"batchId": fee_structure["batchId"], "instituteId": institute_id},
+        {"_id": 0},
+    ).to_list(2000)
+    student_map = {s["id"]: s for s in students}
+    existing_fees = await db.student_fees.find(
+        {"feeStructureId": fee_structure["id"], "instituteId": institute_id}
+    ).to_list(3000)
+    existing_student_ids = {sf["studentId"] for sf in existing_fees}
+
+    for sf in existing_fees:
+        student = student_map.get(sf["studentId"])
+        if student:
+            await _recalculate_student_fee_schedule(sf, fee_structure, student)
+
+    for student in students:
+        if student["id"] not in existing_student_ids:
+            await _assign_student_fee(student["id"], fee_structure, institute_id)
+
+
+def _html_escape(value) -> str:
+    return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _send_fee_receipt_email(receipt: dict, institute: dict, student: dict, batch: dict) -> bool:
+    email = (student or {}).get("email", "")
+    key = os.getenv("RESEND_API_KEY", "")
+    if not email or not key:
+        return False
+
+    email_from = os.getenv("EMAIL_FROM", "Growcad <noreply@growcad.in>")
+    rows = "".join(
+        (
+            "<tr>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>#{item.get('installmentIndex', 0) + 1}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{_html_escape(item.get('dueDate', ''))}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>Rs.{float(item.get('amountApplied', 0)):,.0f}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{_html_escape(item.get('status', ''))}</td>"
+            "</tr>"
+        )
+        for item in receipt.get("appliedInstallments", [])
+    )
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;padding:28px;color:#1f2937">
+      <h2 style="margin:0;color:#6C3CF4">Fee Payment Receipt</h2>
+      <p style="margin:6px 0 18px;color:#6b7280">{_html_escape((institute or {}).get('name', 'Institute'))}</p>
+      <div style="background:#f8f7ff;border:1px solid #e5ddff;border-radius:14px;padding:18px;margin-bottom:18px">
+        <p><strong>Receipt ID:</strong> {_html_escape(receipt.get('id'))}</p>
+        <p><strong>Student:</strong> {_html_escape(receipt.get('studentName'))}</p>
+        <p><strong>Batch:</strong> {_html_escape((batch or {}).get('batchName', receipt.get('batchName', '')))}</p>
+        <p><strong>Payment Date:</strong> {_html_escape(receipt.get('createdAt', '')[:10])}</p>
+        <p><strong>Total Paid:</strong> Rs.{float(receipt.get('amountPaid', 0)):,.0f}</p>
+        <p><strong>Pending After Payment:</strong> Rs.{float(receipt.get('totalPendingAfterPayment', 0)):,.0f}</p>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:14px">
+        <thead>
+          <tr style="background:#f3f0ff;color:#4c1d95">
+            <th style="text-align:left;padding:8px">Installment</th>
+            <th style="text-align:left;padding:8px">Due Date</th>
+            <th style="text-align:left;padding:8px">Amount Applied</th>
+            <th style="text-align:left;padding:8px">Status</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p style="color:#8b5cf6;margin-top:24px;font-size:13px">Powered by Growcad</p>
+    </div>
+    """
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                "https://api.resend.com/emails",
+                json={
+                    "from": email_from,
+                    "to": [email],
+                    "subject": f"Fee receipt {receipt.get('id')}",
+                    "html": html,
+                },
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+        if r.status_code in (200, 201):
+            return True
+        logger.error(f"Fee receipt email failed: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Fee receipt email error: {e}")
+        return False
 
 
 @api.get("/fee-structures")
@@ -2958,7 +3223,33 @@ async def create_fee_structure(data: FeeStructureCreate, user=Depends(admin_only
     fs = {"id": uid(), **data.model_dump(), "instituteId": user["instituteId"], "createdAt": now_iso()}
     await db.fee_structures.insert_one(fs)
     fs.pop("_id", None)
+    await _recalculate_batch_student_fees(fs, user["instituteId"])
     return fs
+
+
+@api.put("/fee-structures/{fsid}")
+async def update_fee_structure(fsid: str, data: FeeStructureCreate, user=Depends(admin_only)):
+    existing = await db.fee_structures.find_one({"id": fsid, "instituteId": user["instituteId"]})
+    if not existing:
+        raise HTTPException(404, "Fee structure not found")
+
+    update = {
+        **data.model_dump(),
+        "totalCourseFee": float(data.totalCourseFee),
+        "numberOfInstallments": max(1, int(data.numberOfInstallments or 1)),
+        "lateFeePerDay": float(data.lateFeePerDay or 0),
+        "updatedAt": now_iso(),
+    }
+    await db.fee_structures.update_one(
+        {"_id": existing["_id"]},
+        {"$set": update},
+    )
+
+    updated = await db.fee_structures.find_one({"id": fsid, "instituteId": user["instituteId"]}, {"_id": 0})
+    await _recalculate_batch_student_fees(updated, user["instituteId"])
+    batch = await db.batches.find_one({"id": updated.get("batchId", ""), "instituteId": user["instituteId"]}, {"_id": 0})
+    updated["batchName"] = batch.get("batchName", "") if batch else ""
+    return updated
 
 
 @api.post("/fees/assign")
@@ -3002,10 +3293,75 @@ async def list_student_fees(user=Depends(auth), studentId: str = "", batchId: st
 
     # 🚀 NO DB CALLS INSIDE LOOP
     for f in fees:
-        f["studentName"] = students_map.get(f["studentId"], {}).get("name", "")
+        student = students_map.get(f["studentId"], {})
+        f["studentName"] = student.get("name", "")
+        f["studentEmail"] = student.get("email", "")
+        f["admissionDate"] = f.get("admissionDate") or student.get("admissionDate", "")
         f["batchName"] = batches_map.get(f.get("batchId", ""), {}).get("batchName", "")
 
+        installments = f.get("installments", []) or []
+        for pos, inst in enumerate(installments):
+            inst.setdefault("index", pos)
+            inst["paidAmount"] = float(inst.get("paidAmount", 0) or 0)
+            if not isinstance(inst.get("payments"), list):
+                inst["payments"] = []
+
+            due = max(0, float(inst.get("amount", 0) or 0) - inst["paidAmount"])
+            if inst["paidAmount"] <= 0:
+                inst["status"] = "pending"
+            elif due <= 0:
+                inst["status"] = "paid"
+            else:
+                inst["status"] = "partial"
+
+        f["totalPaid"] = round(sum(float(i.get("paidAmount", 0) or 0) for i in installments), 2)
+        f["totalPending"] = round(
+            sum(max(0, float(i.get("amount", 0) or 0) - float(i.get("paidAmount", 0) or 0)) for i in installments),
+            2,
+        )
+
     return fees
+
+
+@api.post("/fees/reminder")
+async def send_fee_reminder_for_student_fee(data: dict, user=Depends(admin_only)):
+    student_fee_id = data.get("studentFeeId", "")
+    sf = await db.student_fees.find_one({"id": student_fee_id, "instituteId": user["instituteId"]})
+    if not sf:
+        raise HTTPException(404, "Student fee not found")
+
+    pending_inst = None
+    for inst in sf.get("installments", []) or []:
+        due = max(0, float(inst.get("amount", 0) or 0) - float(inst.get("paidAmount", 0) or 0))
+        if due > 0:
+            pending_inst = {**inst, "dueAmount": due}
+            break
+
+    if not pending_inst:
+        return {"sent": 0, "message": "Fee is already fully paid."}
+
+    student, institute = await asyncio.gather(
+        db.students.find_one({"id": sf["studentId"], "instituteId": user["instituteId"]}, {"_id": 0}),
+        db.institutes.find_one({"id": user["instituteId"]}, {"_id": 0}),
+    )
+    if not student:
+        raise HTTPException(404, "Student not found")
+
+    settings = await _get_reminder_settings(user["instituteId"])
+    logs = await _send_reminder(
+        student,
+        pending_inst["dueAmount"],
+        pending_inst.get("dueDate", ""),
+        "manual",
+        institute,
+        user["instituteId"],
+        settings.get("channels", ["in_app"]),
+    )
+    return {
+        "sent": len(logs),
+        "channels": [entry["channel"] for entry in logs],
+        "message": "Reminder sent.",
+    }
 
 
 @api.post("/fees/pay")
@@ -3013,27 +3369,126 @@ async def pay_fee(data: FeePaymentReq, user=Depends(admin_only)):
     sf = await db.student_fees.find_one({"id": data.studentFeeId, "instituteId": user["instituteId"]})
     if not sf:
         raise HTTPException(404, "Student fee not found")
-    installments = sf["installments"]
-    if data.installmentIndex >= len(installments):
+
+    amount = round(float(data.amount or 0), 2)
+    if amount <= 0:
+        raise HTTPException(400, "Payment amount must be greater than zero")
+
+    installments = sf.get("installments", []) or []
+    if data.installmentIndex < 0 or data.installmentIndex >= len(installments):
         raise HTTPException(400, "Invalid installment index")
-    inst = installments[data.installmentIndex]
-    inst["paidAmount"] = data.amount
-    inst["paidDate"] = now_iso()[:10]
-    inst["status"] = "paid" if data.amount >= inst["amount"] else "partial"
-    total_paid = sum(i.get("paidAmount", 0) for i in installments)
-    total_pending = sf["totalFee"] - total_paid
+
+    receipt_id = f"rcpt_{uid()[:10]}"
+    paid_at = now_iso()
+    remaining = amount
+    applied = []
+
+    for idx in range(data.installmentIndex, len(installments)):
+        if remaining <= 0:
+            break
+
+        inst = installments[idx]
+        inst.setdefault("index", idx)
+        inst.setdefault("payments", [])
+        if not isinstance(inst["payments"], list):
+            inst["payments"] = []
+
+        inst_amount = float(inst.get("amount", 0) or 0)
+        already_paid = float(inst.get("paidAmount", 0) or 0)
+        due = round(max(0, inst_amount - already_paid), 2)
+        if due <= 0:
+            inst["status"] = "paid"
+            continue
+
+        amount_applied = round(min(remaining, due), 2)
+        paid_after = round(already_paid + amount_applied, 2)
+        remaining = round(remaining - amount_applied, 2)
+        due_remaining = round(max(0, inst_amount - paid_after), 2)
+
+        inst["paidAmount"] = paid_after
+        inst["paidDate"] = paid_at[:10]
+        inst["paidAt"] = paid_at
+        inst["status"] = "paid" if due_remaining <= 0 else "partial"
+        inst["payments"].append({
+            "amount": amount_applied,
+            "paidAt": paid_at,
+            "receiptId": receipt_id,
+            "method": data.method or "cash",
+            "note": data.note or "",
+        })
+
+        applied.append({
+            "installmentIndex": idx,
+            "installmentNumber": int(inst.get("index", idx)) + 1,
+            "dueDate": inst.get("dueDate", ""),
+            "amountApplied": amount_applied,
+            "status": inst["status"],
+            "dueRemaining": due_remaining,
+        })
+
+    if not applied:
+        raise HTTPException(400, "No pending installment found for this payment")
+
+    total_paid = round(sum(float(i.get("paidAmount", 0) or 0) for i in installments), 2)
+    total_pending = round(
+        sum(max(0, float(i.get("amount", 0) or 0) - float(i.get("paidAmount", 0) or 0)) for i in installments),
+        2,
+    )
+    credit_balance = round(float(sf.get("creditBalance", 0) or 0) + max(0, remaining), 2)
+
     await db.student_fees.update_one(
         {"_id": sf["_id"]},
-        {"$set": {"installments": installments, "totalPaid": total_paid, "totalPending": total_pending}}
+        {"$set": {
+            "installments": installments,
+            "totalPaid": total_paid,
+            "totalPending": total_pending,
+            "creditBalance": credit_balance,
+            "updatedAt": paid_at,
+        }}
     )
-    student = await db.students.find_one({"id": sf["studentId"]}, {"_id": 0})
+
+    student, batch, institute = await asyncio.gather(
+        db.students.find_one({"id": sf["studentId"], "instituteId": user["instituteId"]}, {"_id": 0}),
+        db.batches.find_one({"id": sf.get("batchId", ""), "instituteId": user["instituteId"]}, {"_id": 0}),
+        db.institutes.find_one({"id": user["instituteId"]}, {"_id": 0}),
+    )
+
+    receipt = {
+        "id": receipt_id,
+        "instituteId": user["instituteId"],
+        "studentFeeId": sf["id"],
+        "studentId": sf["studentId"],
+        "studentName": (student or {}).get("name", ""),
+        "studentEmail": (student or {}).get("email", ""),
+        "batchId": sf.get("batchId", ""),
+        "batchName": (batch or {}).get("batchName", ""),
+        "amountPaid": amount,
+        "amountApplied": round(amount - max(0, remaining), 2),
+        "appliedInstallments": applied,
+        "totalPendingAfterPayment": total_pending,
+        "creditBalance": credit_balance,
+        "emailSent": False,
+        "createdAt": paid_at,
+    }
+    receipt["emailSent"] = await _send_fee_receipt_email(receipt, institute, student, batch)
+    await db.payment_receipts.insert_one(receipt)
+
     await db.notifications.insert_one({
         "id": uid(), "title": "Fee Payment Received",
-        "message": f"Payment of Rs.{data.amount} received from {student['name'] if student else 'student'}",
+        "message": f"Payment of Rs.{amount:,.0f} received from {student['name'] if student else 'student'}",
         "type": "fee", "createdAt": now_iso(), "instituteId": user["instituteId"], "read": False
     })
+
     updated = await db.student_fees.find_one({"id": data.studentFeeId}, {"_id": 0})
-    return updated
+    return {
+        "success": True,
+        "appliedInstallments": applied,
+        "totalApplied": receipt["amountApplied"],
+        "creditBalance": credit_balance,
+        "receiptId": receipt_id,
+        "receiptEmailSent": receipt["emailSent"],
+        "studentFee": updated,
+    }
 
 
 # ─── TESTS ───
@@ -3160,7 +3615,7 @@ async def attendance_report(
     iid = user["instituteId"]
 
     # ── 1. Build match stage ──────────────────────────────────────────────
-    match: dict = {"instituteId": iid}
+    match: dict = {"instituteId": iid, "status": {"$ne": "suspended"}}
     if batchId:
         match["batchId"] = batchId
     if startDate or endDate:
@@ -3787,7 +4242,10 @@ async def student_profile(sid: str, user=Depends(auth)):
         raise HTTPException(404, "Student not found")
     batch = await db.batches.find_one({"id": student.get("batchId", "")}, {"_id": 0})
     # Attendance
-    att = await db.attendance.find({"studentId": sid, "instituteId": iid}, {"_id": 0}).to_list(5000)
+    att = await db.attendance.find(
+        {"studentId": sid, "instituteId": iid, "status": {"$ne": "suspended"}},
+        {"_id": 0},
+    ).to_list(5000)
     present = sum(1 for a in att if a["status"] == "present")
     late = sum(1 for a in att if a["status"] == "late")
     absent = len(att) - present - late
@@ -3883,18 +4341,65 @@ async def delete_announcement(aid: str, user=Depends(admin_only)):
 
 # ─── COMMUNICATION CENTER ───
 
+async def _send_communication_email(email: str, student_name: str, message: str, institute_name: str) -> bool:
+    key = os.getenv("RESEND_API_KEY", "")
+    if not email or not key:
+        return False
+
+    email_from = os.getenv("EMAIL_FROM", "Growcad <noreply@growcad.in>")
+    safe_student = _html_escape(student_name or "Student")
+    safe_message = _html_escape(message).replace("\n", "<br>")
+    safe_institute = _html_escape(institute_name or "Institute")
+
+    html = (
+        '<div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:auto;'
+        'padding:28px;background:#f8f7ff;color:#1f1b2e">'
+        f'<h2 style="margin:0 0 12px;color:#1a1625">Message from {safe_institute}</h2>'
+        f'<p style="margin:0 0 18px">Hello {safe_student},</p>'
+        f'<div style="background:#ffffff;border:1px solid #e7e2ff;border-radius:14px;'
+        f'padding:18px;line-height:1.6">{safe_message}</div>'
+        '<p style="margin:20px 0 0;color:#6b647a;font-size:13px">Sent via Growcad</p>'
+        '</div>'
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                "https://api.resend.com/emails",
+                json={
+                    "from": email_from,
+                    "to": [email],
+                    "subject": f"Message from {institute_name or 'your institute'}",
+                    "html": html,
+                },
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        if r.status_code in (200, 201):
+            return True
+        logger.error(f"Communication email non-200: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Communication email failed to {email}: {e}")
+        return False
+
+
 @api.post("/messages/send")
 async def send_message(data: dict, user=Depends(admin_only)):
     iid = user["instituteId"]
     target_type = data.get("targetType")  # "student" or "batch"
     target_id = data.get("targetId", "")
     message = data.get("message", "").strip()
-    channel = data.get("channel", "in_app")
+    channel = str(data.get("channel", "in_app")).strip().lower()
 
     if not message:
         raise HTTPException(400, "Message is required")
     if target_type not in ("student", "batch"):
         raise HTTPException(400, "targetType must be 'student' or 'batch'")
+    if channel not in ("in_app", "email", "whatsapp"):
+        raise HTTPException(400, "channel must be 'in_app', 'email', or 'whatsapp'.")
 
     institute = await db.institutes.find_one({"id": iid}, {"_id": 0})
     inst_name = institute.get("name", "Institute") if institute else "Institute"
@@ -3914,6 +4419,7 @@ async def send_message(data: dict, user=Depends(admin_only)):
     for student in recipients:
         phone = student.get("phoneNumber", "")
         parent_phone = student.get("parentPhoneNumber", "")
+        email = student.get("email", "")
         full_msg = f"{message} - {inst_name}"
         status = "sent"
 
@@ -3924,36 +4430,41 @@ async def send_message(data: dict, user=Depends(admin_only)):
                 "message": full_msg, "type": "custom_message",
                 "createdAt": now_iso(), "instituteId": iid, "read": False
             })
-        elif channel == "sms":
-            if twilio_client and TWILIO_PHONE:
-                for target in [phone, parent_phone]:
-                    if not target:
-                        continue
-                    try:
-                        twilio_client.messages.create(body=full_msg, from_=TWILIO_PHONE, to=target)
-                    except Exception as e:
-                        logger.error(f"SMS failed to {target}: {e}")
-                        status = "failed"
-            else:
+        elif channel == "email":
+            if not email:
+                status = "skipped_no_email"
+            elif not os.getenv("RESEND_API_KEY", ""):
                 status = "skipped_no_credentials"
+            else:
+                ok = await _send_communication_email(email, student.get("name", "Student"), full_msg, inst_name)
+                status = "sent" if ok else "failed"
         elif channel == "whatsapp":
             if twilio_client and TWILIO_WA:
+                delivered = False
+                failed = False
                 for target in [phone, parent_phone]:
                     if not target:
                         continue
                     try:
                         twilio_client.messages.create(
                             body=full_msg, from_=f"whatsapp:{TWILIO_WA}", to=f"whatsapp:{target}")
+                        delivered = True
                     except Exception as e:
                         logger.error(f"WA failed to {target}: {e}")
-                        status = "failed"
+                        failed = True
+                if delivered:
+                    status = "sent"
+                elif failed:
+                    status = "failed"
+                else:
+                    status = "skipped_no_phone"
             else:
                 status = "skipped_no_credentials"
 
         # Log
         await db.message_logs.insert_one({
             "id": uid(), "studentId": student["id"], "studentName": student.get("name", ""),
-            "phone": phone, "parentPhone": parent_phone,
+            "phone": phone, "parentPhone": parent_phone, "email": email,
             "message": full_msg, "channel": channel, "status": status,
             "targetType": target_type, "targetId": target_id,
             "sentBy": user.get("name", "Admin"),
@@ -3985,6 +4496,7 @@ DEFAULT_FEATURE_FLAGS = {
     "communication_enabled": True,
     "multi_teacher_batches_enabled": False,
     "multi_subject_batches_enabled": False,
+    "late_attendance_enabled": False,
 }
 
 
@@ -4005,6 +4517,7 @@ async def update_feature_flags(data: dict, user=Depends(admin_only)):
         "communication_enabled",
         "multi_teacher_batches_enabled",
         "multi_subject_batches_enabled",
+        "late_attendance_enabled",
     }
     update = {k: bool(v) for k, v in data.items() if k in allowed}
     update["instituteId"] = user["instituteId"]
