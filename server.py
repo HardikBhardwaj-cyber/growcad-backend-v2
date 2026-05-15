@@ -5470,12 +5470,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-c_status,
-            "recordingUrl": rec_url, "driveFileId": "",
-            "recordingDuration": dur_min if rec_status == "ready" else 0,
-            "recordingSize": rec_size,
-            "instituteId": iid, "createdAt": now_iso()
-        })
+
 
     return {
         "message": "Demo data seeded successfully",
