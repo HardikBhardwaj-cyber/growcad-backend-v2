@@ -99,11 +99,16 @@ async def create_indexes():
         {"$unset": {"studentCode": ""}}
     )
 
+    await db.students.update_many(
+        {"studentCode": ""},
+        {"$unset": {"studentCode": ""}}
+    )
+
     await db.students.create_index(
         [("instituteId", 1), ("studentCode", 1)],
         unique=True,
         partialFilterExpression={
-            "studentCode": {"$type": "string", "$ne": ""}
+            "studentCode": {"$exists": True, "$type": "string"}
         },
         name="uniq_institute_student_code"
     )
