@@ -24,7 +24,7 @@ import razorpay
 import hmac
 import secrets
 from pymongo.errors import DuplicateKeyError
-from pymongo import UpdateOne
+from pymongo import UpdateOne, ReturnDocument
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -92,7 +92,9 @@ async def create_indexes():
 
     # ─── students ───
     await db.students.create_index([("instituteId", 1), ("batchId", 1)])
+    await db.students.create_index([("instituteId", 1), ("batchIds", 1)])
     await db.students.create_index([("instituteId", 1), ("name", 1)])
+    await db.students.create_index([("instituteId", 1), ("studentCode", 1)], unique=True, sparse=True)
     await db.students.create_index("email")
 
     # ─── teachers ───
@@ -119,6 +121,9 @@ async def create_indexes():
     await db.tests.create_index([("instituteId", 1), ("batchId", 1)])
     await db.marks.create_index([("testId", 1), ("studentId", 1)])
     await db.marks.create_index([("instituteId", 1), ("studentId", 1)])
+    await db.marks.create_index([("instituteId", 1), ("testId", 1)])  # faster perf-report aggregation
+    await db.tests.create_index([("instituteId", 1), ("subject", 1)])  # subject filter
+    await db.student_fees.create_index([("instituteId", 1), "installments.dueDate"])  # dueDate scans
 
     # ─── notifications ───
     await db.notifications.create_index([("instituteId", 1), ("createdAt", -1)])
@@ -158,6 +163,11 @@ async def create_indexes():
     await db.otp_rate_limits.create_index("target", unique=True)
     await db.otp_rate_limits.create_index("expiresAt", expireAfterSeconds=0)
 
+
+    institutes = await db.institutes.find({}, {"_id": 0, "id": 1}).to_list(1000)
+    for inst in institutes:
+        if inst.get("id"):
+            await _ensure_student_backfill_for_institute(inst["id"])
 
     logger.info("All MongoDB indexes created")
 
@@ -379,6 +389,128 @@ async def _get_teachers_map(institute_id: str, teacher_ids: list = None) -> dict
     return {d["id"]: d for d in docs}
 
 
+def _slugify_student_code_part(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "inst").lower().strip())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "inst"
+
+
+def _normalize_batch_ids(batch_ids=None, batch_id: str = "") -> list:
+    ids = []
+    for bid in (batch_ids or []):
+        bid = str(bid or "").strip()
+        if bid and bid not in ids:
+            ids.append(bid)
+    batch_id = str(batch_id or "").strip()
+    if batch_id and batch_id not in ids:
+        ids.insert(0, batch_id)
+    return ids
+
+
+async def _batch_names_for_ids(institute_id: str, batch_ids: list) -> list:
+    ids = _normalize_batch_ids(batch_ids)
+    if not ids:
+        return []
+    batches = await _get_batches_map(institute_id, ids)
+    return [batches[bid].get("batchName", "") for bid in ids if bid in batches]
+
+
+def _student_code_serial(code: str) -> int:
+    m = re.search(r"-(\d+)$", str(code or ""))
+    return int(m.group(1)) if m else 0
+
+
+async def _sync_student_counter(institute_id: str) -> None:
+    docs = await db.students.find(
+        {"instituteId": institute_id, "studentCode": {"$exists": True, "$ne": ""}},
+        {"_id": 0, "studentCode": 1},
+    ).to_list(5000)
+    max_serial = max([_student_code_serial(d.get("studentCode")) for d in docs] or [0])
+    if max_serial:
+        await db.counters.update_one(
+            {"key": f"student:{institute_id}"},
+            {"$max": {"seq": max_serial}},
+            upsert=True,
+        )
+
+
+async def _generate_student_code(institute_id: str) -> str:
+    institute = await db.institutes.find_one({"id": institute_id}, {"_id": 0}) or {}
+    slug = _slugify_student_code_part(institute.get("slug") or institute.get("name") or institute_id)
+
+    for _ in range(20):
+        counter = await db.counters.find_one_and_update(
+            {"key": f"student:{institute_id}"},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        serial = str(int(counter.get("seq", 1))).zfill(3)
+        code = f"STU-{slug}-{serial}"
+        exists = await db.students.find_one(
+            {"instituteId": institute_id, "studentCode": code},
+            {"_id": 1},
+        )
+        if not exists:
+            return code
+
+    raise HTTPException(500, "Could not generate a unique student ID.")
+
+
+async def _ensure_student_backfill_for_institute(institute_id: str) -> None:
+    await _sync_student_counter(institute_id)
+    missing = await db.students.find({
+        "instituteId": institute_id,
+        "$or": [
+            {"studentCode": {"$exists": False}},
+            {"studentCode": ""},
+            {"batchIds": {"$exists": False}},
+            {"status": {"$exists": False}},
+        ],
+    }, {"_id": 0}).sort("createdAt", 1).to_list(5000)
+
+    for student in missing:
+        batch_ids = _normalize_batch_ids(student.get("batchIds"), student.get("batchId", ""))
+        update = {
+            "batchIds": batch_ids,
+            "batchId": batch_ids[0] if batch_ids else student.get("batchId", ""),
+            "batchNames": await _batch_names_for_ids(institute_id, batch_ids),
+            "status": student.get("status") or "active",
+            "updatedAt": student.get("updatedAt") or now_iso(),
+        }
+        if not student.get("studentCode"):
+            update["studentCode"] = await _generate_student_code(institute_id)
+        await db.students.update_one(
+            {"id": student["id"], "instituteId": institute_id},
+            {"$set": update},
+        )
+
+
+async def _enrich_student_batch_fields(institute_id: str, student: dict) -> dict:
+    batch_ids = _normalize_batch_ids(student.get("batchIds"), student.get("batchId", ""))
+    student["batchIds"] = batch_ids
+    student["batchId"] = batch_ids[0] if batch_ids else student.get("batchId", "")
+    student["batchNames"] = (
+        student.get("batchNames")
+        if isinstance(student.get("batchNames"), list) and student.get("batchNames")
+        else await _batch_names_for_ids(institute_id, batch_ids)
+    )
+    student["status"] = student.get("status") or "active"
+    return student
+
+
+def _active_student_query(institute_id: str) -> dict:
+    return {
+        "instituteId": institute_id,
+        "status": {"$nin": ["deleted", "inactive"]},
+        "active": {"$ne": False},
+    }
+
+
+async def get_active_student_count(institute_id: str) -> int:
+    return await db.students.count_documents(_active_student_query(institute_id))
+
+
 # ---------------------------------------------------------------------------
 # STUDY MATERIALS / CLOUD STORAGE
 # ---------------------------------------------------------------------------
@@ -584,7 +716,7 @@ async def _sync_institute_storage(institute_id: str) -> int:
 
 
 async def _study_material_storage_info(institute_id: str) -> dict:
-    active_students = await db.students.count_documents({"instituteId": institute_id})
+    active_students = await get_active_student_count(institute_id)
     institute = await db.institutes.find_one({"id": institute_id}, {"_id": 0}) or {}
     plan_doc = await db.institute_plans.find_one({"instituteId": institute_id}, {"_id": 0}) or {}
     plan = (plan_doc.get("plan") or institute.get("plan") or "standard").lower()
@@ -660,9 +792,9 @@ async def _material_allowed_for_user(user: dict, material: dict) -> bool:
     if role == "student":
         student = await db.students.find_one(
             {"id": user.get("studentId", ""), "instituteId": user["instituteId"]},
-            {"_id": 0, "batchId": 1},
+            {"_id": 0, "batchId": 1, "batchIds": 1},
         )
-        return bool(student and student.get("batchId") == batch_id)
+        return bool(student and batch_id in _normalize_batch_ids(student.get("batchIds"), student.get("batchId", "")))
     if role == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
         return batch_id in batch_ids
@@ -727,11 +859,12 @@ async def list_study_materials(
     if user["role"] == "student":
         student = await db.students.find_one(
             {"id": user.get("studentId", ""), "instituteId": iid},
-            {"_id": 0, "batchId": 1},
+            {"_id": 0, "batchId": 1, "batchIds": 1},
         )
+        student_batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
         permission_or = [{"accessTarget": {"$in": ["all_batches", "all_students"]}}]
-        if student and student.get("batchId"):
-            permission_or.append({"accessTarget": "batch", "batchId": student["batchId"]})
+        if student_batch_ids:
+            permission_or.append({"accessTarget": "batch", "batchId": {"$in": student_batch_ids}})
     elif user["role"] == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
         permission_or = [{"accessTarget": {"$in": ["all_batches", "all_students"]}}]
@@ -1939,7 +2072,11 @@ async def superadmin_dashboard(user=Depends(auth)):
             {"_id": 0},
         ).sort("createdAt", -1).to_list(1000),
         db.students.aggregate([
-            {"$match": {"instituteId": {"$in": institute_ids}}},
+            {"$match": {
+                "instituteId": {"$in": institute_ids},
+                "status": {"$nin": ["deleted", "inactive"]},
+                "active": {"$ne": False},
+            }},
             {"$group": {"_id": "$instituteId", "count": {"$sum": 1}}},
         ]).to_list(500),
         db.teachers.aggregate([
@@ -2070,7 +2207,9 @@ class StudentCreate(BaseModel):
     parentPhoneNumber: str = ""
     email: str = ""
     batchId: str = ""
+    batchIds: List[str] = []
     admissionDate: str = ""
+    status: str = "active"
 
 
 class TeacherCreate(BaseModel):
@@ -2302,7 +2441,7 @@ async def _admin_dashboard(user):
         notifs,
         announcements,
     ) = await asyncio.gather(
-        db.students.count_documents({"instituteId": iid}),
+        get_active_student_count(iid),
         db.teachers.count_documents({"instituteId": iid}),
         db.student_fees.find(
             {"instituteId": iid},
@@ -2417,7 +2556,8 @@ async def _student_dashboard(user):
     )
 
     # ── Batch + tests in second parallel round (depends on student) ───────
-    batch_id = student.get("batchId", "") if student else ""
+    batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
+    batch_id = batch_ids[0] if batch_ids else ""
     test_ids  = [m["testId"] for m in marks]
 
     async def _none():
@@ -2434,7 +2574,7 @@ async def _student_dashboard(user):
                         {"targetAudience": {"$exists": False}},
                         {"targetAudience": "students"},
                     ]},
-                    {"$or": [{"targetBatchId": ""}, {"targetBatchId": batch_id}]},
+                    {"$or": [{"targetBatchId": ""}, {"targetBatchId": {"$in": batch_ids}}]},
                 ],
             },
             {"_id": 0},
@@ -2501,50 +2641,101 @@ async def _student_dashboard(user):
 
 @api.get("/students")
 async def list_students(user=Depends(auth), batchId: str = "", search: str = ""):
-    q = {"instituteId": user["instituteId"]}
+    iid = user["instituteId"]
+    await _ensure_student_backfill_for_institute(iid)
+
+    conditions = [{"instituteId": iid}]
+
+    def batch_condition(batch_ids):
+        ids = [bid for bid in (batch_ids if isinstance(batch_ids, list) else [batch_ids]) if bid]
+        if not ids:
+            return None
+        return {
+            "$or": [
+                {"batchId": {"$in": ids}},
+                {"batchIds": {"$in": ids}},
+            ]
+        }
+
     # Teachers can only see students in their assigned batches
     if user["role"] == "teacher":
         batch_ids = await get_teacher_batch_ids(user)
         if batchId and batchId in batch_ids:
-            q["batchId"] = batchId
+            conditions.append(batch_condition(batchId))
         elif batch_ids:
-            q["batchId"] = {"$in": batch_ids}
+            conditions.append(batch_condition(batch_ids))
         else:
             return []
     elif user["role"] == "student":
         # Students can only see themselves
-        q["id"] = user.get("studentId", "")
+        conditions.append({"id": user.get("studentId", "")})
     else:
         if batchId:
-            q["batchId"] = batchId
+            conditions.append(batch_condition(batchId))
+
     if search:
-        q["name"] = {"$regex": search, "$options": "i"}
-    return await db.students.find(q, {"_id": 0}).to_list(1000)
+        rx = {"$regex": search, "$options": "i"}
+        conditions.append({"$or": [{"name": rx}, {"email": rx}, {"studentCode": rx}]})
+
+    conditions = [c for c in conditions if c]
+    q = {"$and": conditions} if len(conditions) > 1 else conditions[0]
+    docs = await db.students.find(q, {"_id": 0}).to_list(1000)
+    return [await _enrich_student_batch_fields(iid, d) for d in docs]
 
 
 @api.post("/students")
 async def create_student(data: StudentCreate, user=Depends(admin_only)):
-    s = {"id": uid(), **data.model_dump(), "instituteId": user["instituteId"], "createdAt": now_iso()}
+    iid = user["instituteId"]
+    batch_ids = _normalize_batch_ids(data.batchIds, data.batchId)
+    batch_names = await _batch_names_for_ids(iid, batch_ids)
+    student_code = await _generate_student_code(iid)
+
+    payload = data.model_dump()
+    payload.update({
+        "batchId": batch_ids[0] if batch_ids else "",
+        "batchIds": batch_ids,
+        "batchNames": batch_names,
+        "studentCode": student_code,
+        "status": payload.get("status") or "active",
+    })
+    s = {"id": uid(), **payload, "instituteId": iid, "createdAt": now_iso(), "updatedAt": now_iso()}
     await db.students.insert_one(s)
     s.pop("_id", None)
     if data.email:
         existing = await db.users.find_one({"email": data.email})
         if not existing:
             su = {"id": uid(), "name": data.name, "email": data.email, "passwordHash": hash_pw("student123"),
-                  "role": "student", "instituteId": user["instituteId"], "studentId": s["id"], "createdAt": now_iso()}
+                  "role": "student", "instituteId": iid, "studentId": s["id"], "createdAt": now_iso()}
             await db.users.insert_one(su)
-    if data.batchId:
-        fs = await db.fee_structures.find_one({"batchId": data.batchId, "instituteId": user["instituteId"]}, {"_id": 0})
-        if fs:
-            await _assign_student_fee(s["id"], fs, user["instituteId"])
+    await _assign_student_fees_for_batches(s["id"], batch_ids, iid)
     return s
 
 
 @api.put("/students/{sid}")
 async def update_student(sid: str, data: StudentCreate, user=Depends(admin_only)):
-    update = {k: v for k, v in data.model_dump().items() if v}
-    await db.students.update_one({"id": sid, "instituteId": user["instituteId"]}, {"$set": update})
-    return await db.students.find_one({"id": sid}, {"_id": 0})
+    iid = user["instituteId"]
+    existing = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Student not found")
+
+    payload = data.model_dump()
+    batch_ids = _normalize_batch_ids(payload.get("batchIds"), payload.get("batchId", ""))
+    update = {
+        "name": payload.get("name", ""),
+        "phoneNumber": payload.get("phoneNumber", ""),
+        "parentPhoneNumber": payload.get("parentPhoneNumber", ""),
+        "email": payload.get("email", ""),
+        "batchId": batch_ids[0] if batch_ids else "",
+        "batchIds": batch_ids,
+        "batchNames": await _batch_names_for_ids(iid, batch_ids),
+        "admissionDate": payload.get("admissionDate", ""),
+        "status": payload.get("status") or existing.get("status") or "active",
+        "updatedAt": now_iso(),
+    }
+    await db.students.update_one({"id": sid, "instituteId": iid}, {"$set": update})
+    await _assign_student_fees_for_batches(sid, batch_ids, iid)
+    student = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
+    return await _enrich_student_batch_fields(iid, student)
 
 
 @api.delete("/students/{sid}")
@@ -2563,9 +2754,14 @@ async def bulk_upload_students(file: UploadFile = File(...), user=Depends(admin_
     reader = csv.DictReader(io.StringIO(text))
     iid = user["instituteId"]
 
-    # Pre-load async def _teacher_dashboard(user):batches for name->id lookup
+    # Pre-load batches for name/id lookup
     all_batches = await db.batches.find({"instituteId": iid}, {"_id": 0}).to_list(200)
     batch_map = {b["batchName"].strip().lower(): b["id"] for b in all_batches}
+    batch_id_set = {b["id"] for b in all_batches}
+    batch_name_by_id = {b["id"]: b["batchName"] for b in all_batches}
+
+    def split_multi(value):
+        return [part.strip() for part in str(value or "").split(";") if part.strip()]
 
     success = []
     failed = []
@@ -2576,14 +2772,28 @@ async def bulk_upload_students(file: UploadFile = File(...), user=Depends(admin_
         parent_phone = (row.get("parentPhone") or row.get("parentPhoneNumber") or "").strip()
         email = (row.get("email") or "").strip()
         batch_name = (row.get("batch") or row.get("batchName") or "").strip()
+        batch_names_cell = (row.get("batchNames") or "").strip()
+        batch_ids_cell = (row.get("batchIds") or row.get("batchId") or "").strip()
 
         if not name:
             errors.append("Name is required")
-        batch_id = ""
-        if batch_name:
-            batch_id = batch_map.get(batch_name.lower(), "")
-            if not batch_id:
-                errors.append(f"Batch '{batch_name}' not found")
+        batch_ids = []
+
+        for bid in split_multi(batch_ids_cell):
+            if bid in batch_id_set:
+                batch_ids.append(bid)
+            else:
+                errors.append(f"Batch ID '{bid}' not found")
+
+        name_tokens = split_multi(batch_names_cell) or ([batch_name] if batch_name else [])
+        for name_token in name_tokens:
+            bid = batch_map.get(name_token.lower(), "")
+            if bid:
+                batch_ids.append(bid)
+            else:
+                errors.append(f"Batch '{name_token}' not found")
+
+        batch_ids = _normalize_batch_ids(batch_ids)
 
         if email:
             existing_email = await db.students.find_one({"email": email, "instituteId": iid})
@@ -2595,11 +2805,18 @@ async def bulk_upload_students(file: UploadFile = File(...), user=Depends(admin_
             continue
 
         sid = uid()
+        student_code = await _generate_student_code(iid)
+        batch_names = [batch_name_by_id.get(bid, "") for bid in batch_ids if batch_name_by_id.get(bid)]
         s = {
             "id": sid, "name": name, "phoneNumber": phone,
             "parentPhoneNumber": parent_phone, "email": email,
-            "batchId": batch_id, "admissionDate": now_iso()[:10],
-            "instituteId": iid, "createdAt": now_iso()
+            "batchId": batch_ids[0] if batch_ids else "",
+            "batchIds": batch_ids,
+            "batchNames": batch_names,
+            "studentCode": student_code,
+            "admissionDate": now_iso()[:10],
+            "status": "active",
+            "instituteId": iid, "createdAt": now_iso(), "updatedAt": now_iso()
         }
         await db.students.insert_one(s)
         s.pop("_id", None)
@@ -2614,13 +2831,10 @@ async def bulk_upload_students(file: UploadFile = File(...), user=Depends(admin_
                     "instituteId": iid, "studentId": sid, "createdAt": now_iso()
                 })
 
-        # Auto-assign fee structure
-        if batch_id:
-            fs = await db.fee_structures.find_one({"batchId": batch_id, "instituteId": iid}, {"_id": 0})
-            if fs:
-                await _assign_student_fee(sid, fs, iid)
+        # Auto-assign fee structures for every selected batch
+        await _assign_student_fees_for_batches(sid, batch_ids, iid)
 
-        success.append({"name": name, "email": email, "batch": batch_name})
+        success.append({"name": name, "email": email, "studentCode": student_code, "batches": batch_names})
 
     return {
         "summary": {"total": len(success) + len(failed), "success": len(success), "failed": len(failed)},
@@ -2749,10 +2963,11 @@ async def list_batches(user=Depends(auth)):
         student = await db.students.find_one(
             {"id": user.get("studentId", ""), "instituteId": iid}, {"_id": 0}
         )
-        if student and student.get("batchId"):
+        student_batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
+        if student_batch_ids:
             batches = await db.batches.find(
-                {"id": student["batchId"], "instituteId": iid}, {"_id": 0}
-            ).to_list(1)
+                {"id": {"$in": student_batch_ids}, "instituteId": iid}, {"_id": 0}
+            ).to_list(100)
         else:
             return []
     else:
@@ -2770,15 +2985,21 @@ async def list_batches(user=Depends(auth)):
     })
 
     # Parallel: student counts per batch + teacher lookup
-    count_agg, teachers_map = await asyncio.gather(
-        db.students.aggregate([
-            {"$match": {"batchId": {"$in": bid_list}, "instituteId": iid}},
-            {"$group": {"_id": "$batchId", "count": {"$sum": 1}}},
-        ]).to_list(200),
+    students_for_counts, teachers_map = await asyncio.gather(
+        db.students.find({
+            "instituteId": iid,
+            "status": {"$nin": ["deleted", "inactive"]},
+            "active": {"$ne": False},
+            "$or": [{"batchId": {"$in": bid_list}}, {"batchIds": {"$in": bid_list}}],
+        }, {"_id": 0, "id": 1, "batchId": 1, "batchIds": 1}).to_list(5000),
         _get_teachers_map(iid, tid_list),
     )
 
-    count_map = {r["_id"]: r["count"] for r in count_agg}
+    count_map = {bid: 0 for bid in bid_list}
+    for student in students_for_counts:
+        for bid in set(_normalize_batch_ids(student.get("batchIds"), student.get("batchId", ""))):
+            if bid in count_map:
+                count_map[bid] += 1
 
     for b in batches:
         b["studentCount"] = count_map.get(b["id"], 0)
@@ -3042,6 +3263,15 @@ def _fee_installment_templates(fee_structure: dict, student: dict = None) -> lis
 
 
 async def _assign_student_fee(student_id, fee_structure, institute_id):
+    existing = await db.student_fees.find_one({
+        "studentId": student_id,
+        "feeStructureId": fee_structure["id"],
+        "instituteId": institute_id,
+    })
+    if existing:
+        existing.pop("_id", None)
+        return existing
+
     student = await db.students.find_one({"id": student_id, "instituteId": institute_id}, {"_id": 0})
     installments = _fee_installment_templates(fee_structure, student)
     total = round(sum(float(i.get("amount", 0) or 0) for i in installments), 2)
@@ -3057,6 +3287,16 @@ async def _assign_student_fee(student_id, fee_structure, institute_id):
     await db.student_fees.insert_one(sf)
     sf.pop("_id", None)
     return sf
+
+
+async def _assign_student_fees_for_batches(student_id: str, batch_ids: list, institute_id: str) -> None:
+    for batch_id in _normalize_batch_ids(batch_ids):
+        fs = await db.fee_structures.find_one(
+            {"batchId": batch_id, "instituteId": institute_id},
+            {"_id": 0},
+        )
+        if fs:
+            await _assign_student_fee(student_id, fs, institute_id)
 
 
 def _normalize_existing_installments(installments: list) -> dict:
@@ -3512,8 +3752,9 @@ async def list_tests(user=Depends(auth), batchId: str = ""):
             {"id": user.get("studentId", ""), "instituteId": iid},
             {"_id": 0}
         )
-        if student and student.get("batchId"):
-            q["batchId"] = student["batchId"]
+        student_batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
+        if student_batch_ids:
+            q["batchId"] = {"$in": student_batch_ids}
         else:
             return []
 
@@ -3711,160 +3952,299 @@ async def attendance_report(
 
 
 @api.get("/reports/fees")
-async def fees_report(user=Depends(auth), batchId: str = ""):
+async def fees_report(
+    user=Depends(auth),
+    batchId: str = "",
+    summary: bool = False,
+):
+    """Fees report — single-pass aggregation.
+
+    Bucketing rules (current month vs upcoming):
+      * Paid                     = sum of installment.paidAmount
+      * PendingTillCurrentMonth  = remaining of installments whose dueDate MONTH <= current month
+      * Upcoming                 = remaining of installments whose dueDate MONTH  > current month
+
+    Response shape includes BOTH a new normalized envelope and legacy aliases:
+      {
+        totals: { total, paid, pendingTillCurrentMonth, upcoming },
+        batchWise: [...],
+        overdue: [...],
+        # legacy:
+        paid, pendingTillCurrentMonth, upcoming,
+        totalCollected, totalPending, totalFee,
+        batches: [...], collectionTrend: [...]
+      }
+
+    Pass ?summary=true to skip the overdue scan and trend computation
+    for a faster first-paint response.
+    """
     iid = user["instituteId"]
     q: dict = {"instituteId": iid}
     if batchId:
         q["batchId"] = batchId
 
-    # ── 1. Aggregate totals per batch + overall in ONE pass ───────────────
-    batch_pipeline = [
-        {"$match": q},
-        {"$group": {
-            "_id":       "$batchId",
-            "collected": {"$sum": "$totalPaid"},
-            "pending":   {"$sum": "$totalPending"},
-            "total":     {"$sum": "$totalFee"},
-        }},
-    ]
+    # Slim projection — only what the report needs
+    projection = {"_id": 0,
+        "studentId": 1, "batchId": 1, "installments": 1,
+    }
 
-    overall_pipeline = [
-        {"$match": q},
-        {"$group": {
-            "_id":            None,
-            "totalCollected": {"$sum": "$totalPaid"},
-            "totalPending":   {"$sum": "$totalPending"},
-            "totalFee":       {"$sum": "$totalFee"},
-        }},
-    ]
+    fees = await db.student_fees.find(q, projection).to_list(2000)
 
-    # Fetch raw fees (capped) for overdue scan + trend; parallel with aggregations
-    fees_future = db.student_fees.find(q, {"_id": 0,
-        "studentId": 1, "totalPaid": 1, "totalPending": 1,
-        "totalFee": 1, "batchId": 1, "installments": 1,
-    }).to_list(2000)
+    bid_list = list({f.get("batchId", "") for f in fees if f.get("batchId")})
 
-    batch_agg, overall_agg, fees = await asyncio.gather(
-        db.attendance.aggregate(batch_pipeline).to_list(500)
-        if False else db.student_fees.aggregate(batch_pipeline).to_list(500),
-        db.student_fees.aggregate(overall_pipeline).to_list(1),
-        fees_future,
-    )
+    # When summary=true, we don't need the students map at all (no overdue scan)
+    if summary:
+        batches_map = await _get_batches_map(iid, bid_list)
+        students_map = {}
+    else:
+        sid_list = list({f["studentId"] for f in fees})
+        batches_map, students_map = await asyncio.gather(
+            _get_batches_map(iid, bid_list),
+            _get_students_map(iid, sid_list),
+        )
 
-    # ── 2. Bulk-fetch names ───────────────────────────────────────────────
-    bid_list = list({r["_id"] for r in batch_agg})
-    sid_list = list({f["studentId"] for f in fees})
+    # ── Single-pass bucketing ─────────────────────────────────────────────
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_month = today_str[:7]  # 'YYYY-MM'
 
-    batches_map, students_map = await asyncio.gather(
-        _get_batches_map(iid, bid_list),
-        _get_students_map(iid, sid_list),
-    )
+    batch_buckets: dict = {}
+    overall_paid = 0.0
+    overall_pending_till = 0.0
+    overall_upcoming = 0.0
+    overall_total = 0.0
 
-    # ── 3. Assemble batch summaries ───────────────────────────────────────
-    batch_summaries = [
-        {
-            "batchId":   r["_id"],
-            "batchName": batches_map.get(r["_id"], {}).get("batchName", ""),
-            "collected": r["collected"],
-            "pending":   r["pending"],
-            "total":     r["total"],
-        }
-        for r in batch_agg
-    ]
+    for f in fees:
+        bid = f.get("batchId", "")
+        bucket = batch_buckets.get(bid)
+        if bucket is None:
+            bucket = batch_buckets[bid] = {
+                "batchId":                  bid,
+                "batchName":                batches_map.get(bid, {}).get("batchName", ""),
+                "paid":                     0.0,
+                "pendingTillCurrentMonth":  0.0,
+                "upcoming":                 0.0,
+                "total":                    0.0,
+            }
+        for inst in f.get("installments", []) or []:
+            amount   = float(inst.get("amount", 0)     or 0)
+            paid_amt = float(inst.get("paidAmount", 0) or 0)
+            bucket["total"] += amount
+            bucket["paid"]  += paid_amt
+            overall_total   += amount
+            overall_paid    += paid_amt
+            remaining = amount - paid_amt
+            if remaining <= 0:
+                continue
+            due_month = (inst.get("dueDate") or "")[:7]
+            if not due_month or due_month <= current_month:
+                bucket["pendingTillCurrentMonth"] += remaining
+                overall_pending_till             += remaining
+            else:
+                bucket["upcoming"] += remaining
+                overall_upcoming   += remaining
 
-    overall = overall_agg[0] if overall_agg else {}
+    batch_summaries = []
+    for b in batch_buckets.values():
+        b["paid"]                    = round(b["paid"], 2)
+        b["pendingTillCurrentMonth"] = round(b["pendingTillCurrentMonth"], 2)
+        b["upcoming"]                = round(b["upcoming"], 2)
+        b["total"]                   = round(b["total"], 2)
+        # Legacy keys for older clients
+        b["collected"] = b["paid"]
+        b["pending"]   = round(b["pendingTillCurrentMonth"] + b["upcoming"], 2)
+        batch_summaries.append(b)
 
-    # ── 4. Overdue scan (Python, but no DB calls — maps already loaded) ───
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    totals = {
+        "total":                    round(overall_total, 2),
+        "paid":                     round(overall_paid, 2),
+        "pendingTillCurrentMonth":  round(overall_pending_till, 2),
+        "upcoming":                 round(overall_upcoming, 2),
+    }
+
+    # Build the base response (totals + batchWise) — fast path
+    response = {
+        # New envelope
+        "totals":    totals,
+        "batchWise": batch_summaries,
+        "overdue":   [],
+
+        # Legacy flat aliases
+        "paid":                    totals["paid"],
+        "pendingTillCurrentMonth": totals["pendingTillCurrentMonth"],
+        "upcoming":                totals["upcoming"],
+        "totalCollected":          totals["paid"],
+        "totalPending":            round(totals["pendingTillCurrentMonth"] + totals["upcoming"], 2),
+        "totalFee":                totals["total"],
+        "batches":                 batch_summaries,
+        "collectionTrend":         [],
+    }
+
+    if summary:
+        return response
+
+    # ── Overdue scan ──────────────────────────────────────────────────────
     overdue = []
     for f in fees:
-        if len(overdue) >= 20:
+        if len(overdue) >= 50:
             break
         student = students_map.get(f["studentId"], {})
-        for inst in f.get("installments", []):
+        for inst in f.get("installments", []) or []:
             due = inst.get("dueDate", "")
-            if inst.get("status") != "paid" and due and due < today:
+            amount   = float(inst.get("amount", 0)     or 0)
+            paid_amt = float(inst.get("paidAmount", 0) or 0)
+            remaining = max(0.0, amount - paid_amt)
+            if remaining > 0 and due and due < today_str:
                 overdue.append({
                     "studentName": student.get("name", ""),
-                    "amount":      inst["amount"],
+                    "amount":      round(remaining, 2),
                     "dueDate":     due,
                     "studentId":   f["studentId"],
                 })
-                break  # one overdue entry per student is enough for dashboard
+                break  # one entry per student
 
-    # ── 5. Monthly collection trend ───────────────────────────────────────
+    # ── Monthly collection trend ──────────────────────────────────────────
     monthly_collection: dict = {}
     for f in fees:
-        for inst in f.get("installments", []):
+        for inst in f.get("installments", []) or []:
             pd = inst.get("paidDate")
             if pd:
                 m = pd[:7]
-                monthly_collection[m] = monthly_collection.get(m, 0) + inst.get("paidAmount", 0)
+                monthly_collection[m] = monthly_collection.get(m, 0) + (inst.get("paidAmount", 0) or 0)
 
     collection_trend = [
-        {"month": m, "collected": monthly_collection[m]}
+        {"month": m, "collected": round(monthly_collection[m], 2)}
         for m in sorted(monthly_collection)
     ]
 
-    return {
-        "totalCollected": overall.get("totalCollected", 0),
-        "totalPending":   overall.get("totalPending", 0),
-        "totalFee":       overall.get("totalFee", 0),
-        "batches":        batch_summaries,
-        "overdue":        overdue[:20],
-        "collectionTrend": collection_trend,
-    }
+    response["overdue"]         = overdue[:50]
+    response["collectionTrend"] = collection_trend
+    return response
 
 
 @api.get("/reports/performance")
-async def performance_report(user=Depends(auth), batchId: str = "", subject: str = ""):
+async def performance_report(
+    user=Depends(auth),
+    batchId: str = "",
+    subject: str = "",
+    topLimit: int = 20,
+    testLimit: int = 100,
+):
+    """Aggregated performance report.
+
+    Targets sub-10s response by:
+      * Filtering tests up front (batchId / subject)
+      * Using a single $group aggregation on marks for per-test stats
+      * Using a single $group aggregation on marks for per-student totals
+      * Bulk-fetching batch/student docs once instead of inside loops
+    """
     iid = user["instituteId"]
-    q = {"instituteId": iid}
+    test_q: dict = {"instituteId": iid}
     if batchId:
-        q["batchId"] = batchId
+        test_q["batchId"] = batchId
     if subject:
-        q["subject"] = {"$regex": subject, "$options": "i"}
-    tests = await db.tests.find(q, {"_id": 0}).to_list(100)
+        test_q["subject"] = {"$regex": subject, "$options": "i"}
+
+    # Hard cap to keep payload + work bounded
+    test_limit = max(1, min(int(testLimit or 100), 200))
+    top_limit = max(1, min(int(topLimit or 20), 100))
+
+    tests = await db.tests.find(
+        test_q,
+        {"_id": 0, "id": 1, "testName": 1, "subject": 1,
+         "batchId": 1, "maximumMarks": 1},
+    ).to_list(test_limit)
+
+    if not tests:
+        return {"tests": [], "topStudents": []}
+
+    test_ids = [t["id"] for t in tests]
+    tests_map = {t["id"]: t for t in tests}
+
+    # Per-test aggregation (avg / highest / lowest / count) in one round-trip
+    per_test_pipeline = [
+        {"$match": {"instituteId": iid, "testId": {"$in": test_ids}}},
+        {"$group": {
+            "_id": "$testId",
+            "average": {"$avg": "$marksObtained"},
+            "highest": {"$max": "$marksObtained"},
+            "lowest":  {"$min": "$marksObtained"},
+            "count":   {"$sum": 1},
+        }},
+    ]
+
+    # Per-student totals across the filtered tests in one round-trip.
+    per_student_pipeline = [
+        {"$match": {"instituteId": iid, "testId": {"$in": test_ids}}},
+        {"$group": {
+            "_id": "$studentId",
+            "totalMarks": {"$sum": "$marksObtained"},
+            "testCount":  {"$sum": 1},
+            "testIds":    {"$push": "$testId"},
+        }},
+    ]
+
+    per_test_agg, per_student_agg = await asyncio.gather(
+        db.marks.aggregate(per_test_pipeline).to_list(test_limit),
+        db.marks.aggregate(per_student_pipeline).to_list(5000),
+    )
+
+    # Bulk fetch batch + student docs once
+    batch_ids = list({t.get("batchId", "") for t in tests if t.get("batchId")})
+    sid_list  = [r["_id"] for r in per_student_agg]
+    batches_map, students_map = await asyncio.gather(
+        _get_batches_map(iid, batch_ids),
+        _get_students_map(iid, sid_list),
+    )
+    # Include student batch ids in batches_map fetch as well
+    extra_bids = list({students_map.get(sid, {}).get("batchId", "") for sid in sid_list})
+    extra_bids = [b for b in extra_bids if b and b not in batches_map]
+    if extra_bids:
+        more = await _get_batches_map(iid, extra_bids)
+        batches_map.update(more)
+
+    # ── Assemble per-test rows ───────────────────────────────────────────
+    test_stats = {r["_id"]: r for r in per_test_agg}
     results = []
-    student_totals = {}  # Track aggregate student performance across tests
+    for t in tests:
+        s = test_stats.get(t["id"])
+        if not s:
+            continue
+        batch_name = batches_map.get(t.get("batchId", ""), {}).get("batchName", "")
+        results.append({
+            "testName":      t.get("testName", ""),
+            "subject":       t.get("subject", ""),
+            "batchName":     batch_name,
+            "average":       round(s["average"] or 0, 1),
+            "highest":       s["highest"],
+            "lowest":        s["lowest"],
+            "totalStudents": s["count"],
+            "maximumMarks":  t.get("maximumMarks", 0),
+        })
 
-    for test in tests:
-        marks = await db.marks.find({"testId": test["id"], "instituteId": iid}, {"_id": 0}).to_list(1000)
-        if marks:
-            avg = round(sum(m["marksObtained"] for m in marks) / len(marks), 1)
-            highest = max(m["marksObtained"] for m in marks)
-            lowest = min(m["marksObtained"] for m in marks)
-            batch = await db.batches.find_one({"id": test.get("batchId", "")}, {"_id": 0})
-            results.append({
-                "testName": test["testName"], "subject": test.get("subject", ""),
-                "batchName": batch["batchName"] if batch else "",
-                "average": avg, "highest": highest, "lowest": lowest,
-                "totalStudents": len(marks), "maximumMarks": test["maximumMarks"]
-            })
-            for m in marks:
-                sid = m["studentId"]
-                if sid not in student_totals:
-                    student_totals[sid] = {"totalMarks": 0, "totalMax": 0, "testCount": 0}
-                student_totals[sid]["totalMarks"] += m["marksObtained"]
-                student_totals[sid]["totalMax"] += test["maximumMarks"]
-                student_totals[sid]["testCount"] += 1
-
-    # Top performing students
+    # ── Assemble top-students using tests_map for per-test maxMarks ──────
     top_students = []
-    for sid, data in student_totals.items():
-        pct = round(data["totalMarks"] / data["totalMax"] * 100, 1) if data["totalMax"] > 0 else 0
-        student = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
-        if student:
-            batch = await db.batches.find_one({"id": student.get("batchId", "")}, {"_id": 0})
-            top_students.append({
-                "studentId": sid, "studentName": student["name"],
-                "batchName": batch["batchName"] if batch else "",
-                "totalMarks": round(data["totalMarks"], 1), "totalMax": data["totalMax"],
-                "percentage": pct, "testCount": data["testCount"]
-            })
+    for r in per_student_agg:
+        sid = r["_id"]
+        student = students_map.get(sid)
+        if not student:
+            continue
+        total_max = 0
+        for tid in r.get("testIds", []):
+            total_max += float(tests_map.get(tid, {}).get("maximumMarks", 0) or 0)
+        pct = round((r["totalMarks"] / total_max * 100), 1) if total_max > 0 else 0
+        batch_name = batches_map.get(student.get("batchId", ""), {}).get("batchName", "")
+        top_students.append({
+            "studentId":   sid,
+            "studentName": student.get("name", ""),
+            "batchName":   batch_name,
+            "totalMarks":  round(r["totalMarks"], 1),
+            "totalMax":    total_max,
+            "percentage":  pct,
+            "testCount":   r["testCount"],
+        })
     top_students.sort(key=lambda x: x["percentage"], reverse=True)
 
-    return {"tests": results, "topStudents": top_students[:20]}
+    return {"tests": results, "topStudents": top_students[:top_limit]}
 
 
 # ─── NOTIFICATIONS ───
@@ -4240,7 +4620,15 @@ async def student_profile(sid: str, user=Depends(auth)):
     student = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
     if not student:
         raise HTTPException(404, "Student not found")
+    if not student.get("studentCode") or not student.get("batchIds"):
+        await _ensure_student_backfill_for_institute(iid)
+        student = await db.students.find_one({"id": sid, "instituteId": iid}, {"_id": 0})
+    student = await _enrich_student_batch_fields(iid, student)
     batch = await db.batches.find_one({"id": student.get("batchId", "")}, {"_id": 0})
+    batches = await db.batches.find(
+        {"id": {"$in": student.get("batchIds", [])}, "instituteId": iid},
+        {"_id": 0},
+    ).to_list(100) if student.get("batchIds") else []
     # Attendance
     att = await db.attendance.find(
         {"studentId": sid, "instituteId": iid, "status": {"$ne": "suspended"}},
@@ -4279,6 +4667,7 @@ async def student_profile(sid: str, user=Depends(auth)):
     return {
         "student": student,
         "batch": batch,
+        "batches": batches,
         "attendance": {"present": present, "late": late, "absent": absent, "total": len(att), "rate": att_rate},
         "fees": {"totalFee": total_fee, "totalPaid": total_paid, "totalPending": total_pending, "records": fees},
         "tests": test_results
@@ -4294,13 +4683,13 @@ async def list_announcements(user=Depends(auth), limit: int = 20):
     # Students only see announcements targeted at all or their batch
     if user["role"] == "student":
         student = await db.students.find_one({"id": user.get("studentId", "")}, {"_id": 0})
-        bid = student.get("batchId", "") if student else ""
+        batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
         q["$and"] = [
             {"$or": [
                 {"targetAudience": {"$exists": False}},
                 {"targetAudience": "students"},
             ]},
-            {"$or": [{"targetBatchId": ""}, {"targetBatchId": bid}]},
+            {"$or": [{"targetBatchId": ""}, {"targetBatchId": {"$in": batch_ids}}]},
         ]
     elif user["role"] == "teacher":
         q["targetAudience"] = "teachers"
@@ -4411,7 +4800,10 @@ async def send_message(data: dict, user=Depends(admin_only)):
             raise HTTPException(404, "Student not found")
         recipients.append(student)
     else:
-        students = await db.students.find({"batchId": target_id, "instituteId": iid}, {"_id": 0}).to_list(200)
+        students = await db.students.find({
+            "instituteId": iid,
+            "$or": [{"batchId": target_id}, {"batchIds": target_id}],
+        }, {"_id": 0}).to_list(500)
         recipients = students
 
     sent = 0
@@ -4599,8 +4991,9 @@ async def list_live_classes(user=Depends(auth)):
     # Student: only their batch's classes
     if user["role"] == "student":
         student = await db.students.find_one({"id": user.get("studentId", "")}, {"_id": 0})
-        if student:
-            q["batchId"] = student.get("batchId", "")
+        student_batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
+        if student_batch_ids:
+            q["batchId"] = {"$in": student_batch_ids}
         else:
             return []
 
@@ -4661,8 +5054,11 @@ async def upcoming_classes_widget(user=Depends(auth)):
         q["teacherId"] = user.get("teacherId", "")
     elif user["role"] == "student":
         student = await db.students.find_one({"id": user.get("studentId", "")}, {"_id": 0})
-        if student:
-            q["batchId"] = student.get("batchId", "")
+        student_batch_ids = _normalize_batch_ids((student or {}).get("batchIds"), (student or {}).get("batchId", ""))
+        if student_batch_ids:
+            q["batchId"] = {"$in": student_batch_ids}
+        else:
+            return []
 
     classes = await db.live_classes.find(q, {"_id": 0}).sort("startTime", 1).to_list(5)
     for c in classes:
@@ -5022,6 +5418,59 @@ async def do_seed():
             "calendarEventId": f"evt_{uid()[:8]}",
             "createdBy": "Admin", "planType": "standard",
             "recordingEnabled": rec_enabled, "recordingStatus": rec_status,
+            "recordingUrl": rec_url, "driveFileId": "",
+            "recordingDuration": dur_min if rec_status == "ready" else 0,
+            "recordingSize": rec_size,
+            "instituteId": iid, "createdAt": now_iso()
+        })
+
+    return {
+        "message": "Demo data seeded successfully",
+        "credentials": {
+            "admin": "admin@growcad.in / admin123",
+            "teacher": "teacher@growcad.in / teacher123",
+            "student": "student@growcad.in / student123"
+        }
+    }
+
+
+@api.post("/seed")
+async def seed_endpoint():
+    if os.environ.get("ENV") == "production":
+        raise HTTPException(404)
+    return await do_seed()
+
+
+
+app.include_router(api)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup():
+    logger.info("Starting Growcad API...")
+    await ensure_superadmin_account()
+
+    if os.environ.get("ENV") != "production":
+        await do_seed()
+
+    asyncio.create_task(_reminder_background_loop())
+    logger.info("Fee reminder background job started")
+    asyncio.create_task(_process_recordings())
+    logger.info("Recording pipeline background job started")
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
+c_status,
             "recordingUrl": rec_url, "driveFileId": "",
             "recordingDuration": dur_min if rec_status == "ready" else 0,
             "recordingSize": rec_size,
