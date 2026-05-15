@@ -94,7 +94,19 @@ async def create_indexes():
     await db.students.create_index([("instituteId", 1), ("batchId", 1)])
     await db.students.create_index([("instituteId", 1), ("batchIds", 1)])
     await db.students.create_index([("instituteId", 1), ("name", 1)])
-    await db.students.create_index([("instituteId", 1), ("studentCode", 1)], unique=True, sparse=True)
+    await db.students.update_many(
+        {"studentCode": None},
+        {"$unset": {"studentCode": ""}}
+    )
+
+    await db.students.create_index(
+        [("instituteId", 1), ("studentCode", 1)],
+        unique=True,
+        partialFilterExpression={
+            "studentCode": {"$type": "string", "$ne": ""}
+        },
+        name="uniq_institute_student_code"
+    )
     await db.students.create_index("email")
 
     # ─── teachers ───
